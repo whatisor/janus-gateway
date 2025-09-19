@@ -1202,6 +1202,8 @@ room-<unique room ID>: {
  */
 
 #include "plugin.h"
+#include "janus_ab_module.h"
+#include <dlfcn.h>
 #ifdef __FreeBSD__
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1438,7 +1440,10 @@ static struct janus_json_parameter configure_parameters[] = {
 	{"display", JSON_STRING, 0},
 	{"generate_offer", JANUS_JSON_BOOL, 0},
 	{"rtp", JSON_OBJECT, 0},
-	{"update", JANUS_JSON_BOOL, 0}
+    {"update", JANUS_JSON_BOOL, 0},
+    {"abmod_load", JSON_STRING, 0},          /* path to module .so to load */
+    {"abmod_unload", JANUS_JSON_BOOL, 0},    /* unload current module if true */
+    {"abmod_config", JSON_STRING, 0}         /* optional module config json */
 };
 static struct janus_json_parameter rtp_forward_parameters[] = {
 	{"group", JSON_STRING, 0},
@@ -1492,6 +1497,10 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 static void *janus_audiobridge_mixer_thread(void *data);
 static void *janus_audiobridge_participant_thread(void *data);
 static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle);
+/* Custom module callback: emit event upward */
+static void janus_audiobridge_abmod_emit_event(void *user,
+        const char *event_name,
+        const char *json_payload);
 
 /* Extension to add while recording (e.g., "tmp" --> ".wav.tmp") */
 static char *rec_tempext = NULL;
@@ -1562,6 +1571,15 @@ typedef struct janus_audiobridge_room {
 	janus_mutex rtp_mutex;		/* Mutex to lock the RTP forwarders list */
 	int rtp_udp_sock;			/* UDP socket to use to forward RTP packets */
 	janus_refcount ref;			/* Reference counter for this room */
+    /* Optional dynamically loaded custom module */
+    void *abmod_lib;            /* dlopen handle */
+    void *abmod_ctx;            /* module context */
+    char *abmod_path;           /* path of loaded module */
+    char *abmod_config;         /* JSON config string */
+    janus_abmod_create_f abmod_create;
+    janus_abmod_destroy_f abmod_destroy;
+    janus_abmod_on_mix_f abmod_on_mix;
+    janus_abmod_on_event_f abmod_on_event;
 } janus_audiobridge_room;
 static GHashTable *rooms;
 static janus_mutex rooms_mutex = JANUS_MUTEX_INITIALIZER;
@@ -1988,6 +2006,12 @@ static void janus_audiobridge_room_destroy(janus_audiobridge_room *audiobridge) 
 static void janus_audiobridge_room_free(const janus_refcount *audiobridge_ref) {
 	janus_audiobridge_room *audiobridge = janus_refcount_containerof(audiobridge_ref, janus_audiobridge_room, ref);
 	/* This room can be destroyed, free all the resources */
+	if(audiobridge->abmod_ctx && audiobridge->abmod_destroy)
+		audiobridge->abmod_destroy(audiobridge->abmod_ctx);
+	if(audiobridge->abmod_lib)
+		dlclose(audiobridge->abmod_lib);
+	g_free(audiobridge->abmod_path);
+	g_free(audiobridge->abmod_config);
 	g_free(audiobridge->room_id_str);
 	g_free(audiobridge->room_name);
 	g_free(audiobridge->room_secret);
@@ -7280,6 +7304,97 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *gen_offer = json_object_get(root, "generate_offer");
 			json_t *update = json_object_get(root, "update");
 			json_t *rtp = json_object_get(root, "rtp");
+			json_t *abmod_load = json_object_get(root, "abmod_load");
+			json_t *abmod_unload = json_object_get(root, "abmod_unload");
+			json_t *abmod_config = json_object_get(root, "abmod_config");
+			/* Handle dynamic custom module load/unload per room */
+			if(abmod_unload && json_is_true(abmod_unload)) {
+				janus_mutex_lock(&rooms_mutex);
+				janus_audiobridge_room *audiobridge = participant->room;
+				if(audiobridge) {
+					janus_mutex_lock(&audiobridge->mutex);
+					if(audiobridge->abmod_ctx && audiobridge->abmod_destroy) {
+						audiobridge->abmod_destroy(audiobridge->abmod_ctx);
+						audiobridge->abmod_ctx = NULL;
+					}
+					if(audiobridge->abmod_lib) {
+						dlclose(audiobridge->abmod_lib);
+						audiobridge->abmod_lib = NULL;
+					}
+					g_clear_pointer(&audiobridge->abmod_path, g_free);
+					g_clear_pointer(&audiobridge->abmod_config, g_free);
+					audiobridge->abmod_create = NULL;
+					audiobridge->abmod_destroy = NULL;
+					audiobridge->abmod_on_mix = NULL;
+					audiobridge->abmod_on_event = NULL;
+					janus_mutex_unlock(&audiobridge->mutex);
+				}
+				janus_mutex_unlock(&rooms_mutex);
+			}
+			if(abmod_load && json_is_string(abmod_load)) {
+				const char *path = json_string_value(abmod_load);
+				const char *cfg = abmod_config && json_is_string(abmod_config) ? json_string_value(abmod_config) : NULL;
+				janus_mutex_lock(&rooms_mutex);
+				janus_audiobridge_room *audiobridge = participant->room;
+				if(audiobridge) {
+					janus_mutex_lock(&audiobridge->mutex);
+					/* unload previous if any */
+					if(audiobridge->abmod_ctx && audiobridge->abmod_destroy) {
+						audiobridge->abmod_destroy(audiobridge->abmod_ctx);
+						audiobridge->abmod_ctx = NULL;
+					}
+					if(audiobridge->abmod_lib) {
+						dlclose(audiobridge->abmod_lib);
+						audiobridge->abmod_lib = NULL;
+					}
+					g_free(audiobridge->abmod_path);
+					audiobridge->abmod_path = g_strdup(path);
+					g_free(audiobridge->abmod_config);
+					audiobridge->abmod_config = cfg ? g_strdup(cfg) : NULL;
+					/* open and resolve symbols */
+					void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+					if(!lib) {
+						JANUS_LOG(LOG_ERR, "[AudioBridge] abmod dlopen failed: %s\n", dlerror());
+					} else {
+						audiobridge->abmod_create = (janus_abmod_create_f)dlsym(lib, JANUS_ABMOD_CREATE_SYMBOL);
+						audiobridge->abmod_destroy = (janus_abmod_destroy_f)dlsym(lib, JANUS_ABMOD_DESTROY_SYMBOL);
+						audiobridge->abmod_on_mix = (janus_abmod_on_mix_f)dlsym(lib, JANUS_ABMOD_ON_MIX_SYMBOL);
+						audiobridge->abmod_on_event = (janus_abmod_on_event_f)dlsym(lib, JANUS_ABMOD_ON_EVENT_SYMBOL);
+						if(!audiobridge->abmod_create || !audiobridge->abmod_destroy || !audiobridge->abmod_on_mix) {
+							JANUS_LOG(LOG_ERR, "[AudioBridge] abmod missing required symbols\n");
+							dlclose(lib);
+							lib = NULL;
+							audiobridge->abmod_create = NULL;
+							audiobridge->abmod_destroy = NULL;
+							audiobridge->abmod_on_mix = NULL;
+							audiobridge->abmod_on_event = NULL;
+						} else {
+							/* create instance using room parameters */
+							int channels = audiobridge->spatial_audio ? 2 : 1;
+							janus_abmod_callbacks cbs = { 0 };
+							cbs.emit_event = janus_audiobridge_abmod_emit_event;
+							cbs.emit_event_user = audiobridge;
+							void *ctx = audiobridge->abmod_create(audiobridge->sampling_rate, channels,
+								audiobridge->abmod_config, &cbs, NULL);
+							if(!ctx) {
+								JANUS_LOG(LOG_ERR, "[AudioBridge] abmod_create failed\n");
+								dlclose(lib);
+								lib = NULL;
+								audiobridge->abmod_create = NULL;
+								audiobridge->abmod_destroy = NULL;
+								audiobridge->abmod_on_mix = NULL;
+								audiobridge->abmod_on_event = NULL;
+							} else {
+								audiobridge->abmod_lib = lib;
+								audiobridge->abmod_ctx = ctx;
+								JANUS_LOG(LOG_INFO, "[AudioBridge] abmod loaded: %s\n", path);
+							}
+						}
+					}
+					janus_mutex_unlock(&audiobridge->mutex);
+				}
+				janus_mutex_unlock(&rooms_mutex);
+			}
 			if(rtp != NULL) {
 				JANUS_VALIDATE_JSON_OBJECT(root, rtp_parameters,
 					error_code, error_cause, TRUE,
@@ -8833,6 +8948,16 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			fwrite(outBuffer, sizeof(opus_int16), samples, audiobridge->recording);
 			/* Every 5 seconds we update the wav header */
+		/* Always feed mixed PCM to custom module, when present and room not empty */
+		if(audiobridge->abmod_ctx && audiobridge->abmod_on_mix && g_list_length(participants_list) > 0) {
+			/* Ensure outBuffer is filled even when we're not recording */
+			if(audiobridge->recording == NULL) {
+				for(i=0; i<samples; i++)
+					outBuffer[i] = buffer[i];
+			}
+			int channels = audiobridge->spatial_audio ? 2 : 1;
+			audiobridge->abmod_on_mix(audiobridge->abmod_ctx, outBuffer, samples, audiobridge->sampling_rate, channels);
+		}
 			gint64 now = janus_get_monotonic_time();
 			if(now - audiobridge->record_lastupdate >= 5*G_USEC_PER_SEC) {
 				audiobridge->record_lastupdate = now;
@@ -9664,6 +9789,14 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 				/* Notify the speaker this event is related to as well */
 				janus_audiobridge_notify_participants(participant, event, TRUE);
 				json_decref(event);
+				/* Also notify custom module */
+				if(participant->room->abmod_ctx && participant->room->abmod_on_event) {
+					const char *ev = participant->talking ? "talking" : "stopped-talking";
+					participant->room->abmod_on_event(participant->room->abmod_ctx,
+						ev,
+						participant->room->room_id_str,
+						participant->user_id_str);
+				}
 				janus_mutex_unlock(&participant->room->mutex);
 				/* Also notify event handlers */
 				if(notify_events && gateway->events_is_enabled()) {
@@ -9679,6 +9812,26 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 			}
 		}
 	}
+}
+
+/* Custom module callback implementation: currently just logs and forwards as Janus event */
+static void janus_audiobridge_abmod_emit_event(void *user,
+        const char *event_name,
+        const char *json_payload) {
+    janus_audiobridge_room *audiobridge = (janus_audiobridge_room *)user;
+    if(!audiobridge || !notify_events || !gateway->events_is_enabled())
+        return;
+    json_t *info = json_object();
+    json_object_set_new(info, "audiobridge", json_string(event_name ? event_name : "abmod"));
+    json_object_set_new(info, "room",
+        string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
+    if(json_payload) {
+        json_error_t jerr;
+        json_t *payload = json_loads(json_payload, 0, &jerr);
+        if(payload)
+            json_object_set_new(info, "payload", payload);
+    }
+    gateway->notify_event(&janus_audiobridge_plugin, NULL, info);
 }
 
 #ifdef HAVE_RNNOISE
