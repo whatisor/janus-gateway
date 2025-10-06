@@ -1580,6 +1580,9 @@ typedef struct janus_audiobridge_room {
     janus_abmod_destroy_f abmod_destroy;
     janus_abmod_on_mix_f abmod_on_mix;
     janus_abmod_on_event_f abmod_on_event;
+    /* Sequencing for module correlation */
+    uint64_t frame_seq;         /* increments every mixed frame */
+    uint64_t talk_version;      /* increments on each talk state change */
 } janus_audiobridge_room;
 static GHashTable *rooms;
 static janus_mutex rooms_mutex = JANUS_MUTEX_INITIALIZER;
@@ -8696,9 +8699,10 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			JANUS_LOG(LOG_INFO, "First user/forwarder/file just joined room %s, waking it up...\n", audiobridge->room_id_str);
 		}
 		prev_count = count+rf_count+pf_count;
-		/* Update RTP header information */
-		seq++;
-		ts += OPUS_SAMPLES;
+        /* Update RTP header information */
+        seq++;
+        ts += OPUS_SAMPLES;
+        audiobridge->frame_seq++;
 		/* Mix all contributions */
 		GList *participants_list = g_hash_table_get_values(audiobridge->participants);
 		/* Add a reference to all these participants, in case some leave while we're mixing */
@@ -8948,16 +8952,6 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			}
 			fwrite(outBuffer, sizeof(opus_int16), samples, audiobridge->recording);
 			/* Every 5 seconds we update the wav header */
-		/* Always feed mixed PCM to custom module, when present and room not empty */
-		if(audiobridge->abmod_ctx && audiobridge->abmod_on_mix && g_list_length(participants_list) > 0) {
-			/* Ensure outBuffer is filled even when we're not recording */
-			if(audiobridge->recording == NULL) {
-				for(i=0; i<samples; i++)
-					outBuffer[i] = buffer[i];
-			}
-			int channels = audiobridge->spatial_audio ? 2 : 1;
-			audiobridge->abmod_on_mix(audiobridge->abmod_ctx, outBuffer, samples, audiobridge->sampling_rate, channels);
-		}
 			gint64 now = janus_get_monotonic_time();
 			if(now - audiobridge->record_lastupdate >= 5*G_USEC_PER_SEC) {
 				audiobridge->record_lastupdate = now;
@@ -8975,6 +8969,16 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 					fseek(audiobridge->recording, 0, SEEK_END);
 				}
 			}
+		}
+		/* Always feed mixed PCM to custom module, when present and room not empty */
+		if(audiobridge->abmod_ctx && audiobridge->abmod_on_mix && g_list_length(participants_list) > 0) {
+			/* Prepare outBuffer if we didn't just write it for recording */
+			if(audiobridge->recording == NULL) {
+				for(i=0; i<samples; i++)
+					outBuffer[i] = buffer[i];
+			}
+			int channels = audiobridge->spatial_audio ? 2 : 1;
+			audiobridge->abmod_on_mix(audiobridge->abmod_ctx, outBuffer, samples, audiobridge->sampling_rate, channels, ts, audiobridge->frame_seq, audiobridge->talk_version);
 		}
 		/* Send proper packet to each participant (remove own contribution) */
 		ps = participants_list;
@@ -9790,13 +9794,16 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 				janus_audiobridge_notify_participants(participant, event, TRUE);
 				json_decref(event);
 				/* Also notify custom module */
-				if(participant->room->abmod_ctx && participant->room->abmod_on_event) {
-					const char *ev = participant->talking ? "talking" : "stopped-talking";
-					participant->room->abmod_on_event(participant->room->abmod_ctx,
-						ev,
-						participant->room->room_id_str,
-						participant->user_id_str);
-				}
+                if(participant->room->abmod_ctx && participant->room->abmod_on_event) {
+                    const char *ev = participant->talking ? "talking" : "stopped-talking";
+                    participant->room->talk_version++;
+                    participant->room->abmod_on_event(participant->room->abmod_ctx,
+                        ev,
+                        participant->room->room_id_str,
+                        participant->user_id_str,
+                        janus_get_monotonic_time(),
+                        participant->room->talk_version);
+                }
 				janus_mutex_unlock(&participant->room->mutex);
 				/* Also notify event handlers */
 				if(notify_events && gateway->events_is_enabled()) {

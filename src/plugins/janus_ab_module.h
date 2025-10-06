@@ -40,13 +40,18 @@ typedef void (*janus_abmod_on_mix_f)(void *ctx,
         const int16_t *pcm,
         size_t samples,
         uint32_t sampling_rate,
-        int channels);
+        int channels,
+        uint32_t rtp_timestamp,
+        uint64_t frame_seq,
+        uint64_t active_talk_version);
 
 /* Called on talk state change events */
 typedef void (*janus_abmod_on_event_f)(void *ctx,
         const char *event_name, /* e.g., "talking" or "stopped-talking" */
         const char *room_id,
-        const char *user_id);
+        const char *user_id,
+        int64_t event_time_us,
+        uint64_t talk_version);
 
 /* Symbol names that modules must export */
 #define JANUS_ABMOD_CREATE_SYMBOL "abmod_create"

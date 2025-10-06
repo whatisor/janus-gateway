@@ -409,8 +409,10 @@ EXTRA_DIST += ../conf/janus.plugin.audiobridge.jcfg.sample
 endif
 
 # Build the sample AudioBridge custom module as a separate shared object
-plugin_LTLIBRARIES += plugins/libabmod_transcriber_template.la
-plugins_libabmod_transcriber_template_la_SOURCES = plugins/abmod_transcriber_template.c plugins/janus_ab_module.h
+# Install it under lib/janus/abmodules so Janus won't auto-load it as a core plugin
+abmoduledir = $(libdir)/janus/abmodules
+abmodule_LTLIBRARIES = plugins/libabmod_transcriber_template.la
+plugins_libabmod_transcriber_template_la_SOURCES = plugins/abmod_transcriber_template.c plugins/abmod_consumer.c plugins/janus_ab_module.h plugins/abmod_consumer.h
 plugins_libabmod_transcriber_template_la_CFLAGS = $(plugins_cflags)
 plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version
 plugins_libabmod_transcriber_template_la_LIBADD = $(plugins_libadd)

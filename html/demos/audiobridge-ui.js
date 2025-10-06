@@ -66,6 +66,8 @@ function onJoined(msg) {
   $('#audiojoin').addClass('hide');
   $('#room').removeClass('hide');
   $('#participant').removeClass('hide').html(audiobridge.username).removeClass('hide');
+  // Start WebRTC: create local offer to send mic
+  startPeerConnection();
 }
 
 function onParticipants(list) {
@@ -230,3 +232,19 @@ function getQueryStringValue(name) {
     results = regex.exec(location.search);
   return results === null ? "" : decodeURIComponent(results[1].replace(/\+/g, " "));
 } 
+
+// Create a local offer (audio only) and send to the plugin, to trigger mic permission and PC setup
+function startPeerConnection() {
+  if(!audiobridge || !audiobridge.pluginHandle)
+    return;
+  audiobridge.pluginHandle.createOffer({
+    media: { audio: true, video: false, data: true },
+    success: function(jsep) {
+      let body = { request: 'configure', muted: false, audio: true };
+      audiobridge.pluginHandle.send({ message: body, jsep: jsep });
+    },
+    error: function(error) {
+      if(onError) onError(error);
+    }
+  });
+}

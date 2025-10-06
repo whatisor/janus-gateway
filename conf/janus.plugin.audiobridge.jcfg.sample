@@ -80,4 +80,10 @@ room-1234: {
 	record = false
 	#record_dir = "/path/to/"
 	#record_file = "recording.wav"
+	
+	audiolevel_ext = true
+	audiolevel_event = true
+	#optional
+	audio_active_packets = 20
+	audio_level_average = 35
 }

@@ -137,7 +137,21 @@ $(document).ready(function() {
 															success: function(jsep) {
 																Janus.debug("Got SDP!", jsep);
 																let publish = { request: "configure", muted: false };
-																mixertest.send({ message: publish, jsep: jsep });
+								mixertest.send({ message: publish, jsep: jsep });
+								// Also expose buttons to load/unload the custom AB module
+								if($('#loadabmod').length === 0) {
+									$('.top-right').append('<button class="btn btn-warning" id="loadabmod">Load ABMod</button>');
+									$('#loadabmod').off('click').on('click', function() {
+										let path = '/opt/janus/lib/janus/abmodules/libabmod_transcriber_template.so';
+										mixertest.send({ message: { request: 'configure', abmod_load: path, abmod_config: '{}' } });
+									});
+								}
+								if($('#unloadabmod').length === 0) {
+									$('.top-right').append('<button class="btn btn-outline-warning" id="unloadabmod">Unload ABMod</button>');
+									$('#unloadabmod').off('click').on('click', function() {
+										mixertest.send({ message: { request: 'configure', abmod_unload: true } });
+									});
+								}
 															},
 															error: function(error) {
 																Janus.error("WebRTC error:", error);
