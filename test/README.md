@@ -76,21 +76,21 @@ docker run --rm -it `
 docker build -t janus-dev --target dev .
 
 # Build with bind-mounts (source and output)
-docker run --rm -it `
-  -v ${PWD}:/work `
-  -v ${PWD}/out:/out `
+docker run --rm -it 
+  -v ${PWD}:/work 
+  -v ${PWD}/out:/out 
   janus-dev bash -lc "sh autogen.sh && ./configure --prefix=/opt/janus && make -j 10 && make install DESTDIR=/out && make configs || true"
 
 # Build runtime image
 docker build -t janus-runtime --target runtime .
 
 # Run with bind-mounted install
-docker run --rm -it `
-  -v ${PWD}/out/opt/janus:/opt/janus `
-  -p 8088:8088 -p 8089:8089 -p 8188:8188 -p 7088:7088 -p 7089:7089 `
-  -p 20000-20004:20000-20004/udp `
-  janus-runtime /opt/janus/bin/janus `
-    -F /opt/janus/etc/janus `
-    --rtp-port-range=20000-20004 `
-    --stun-server=stun.l.google.com:19302 `
+docker run --rm -it 
+  -v ${PWD}/out/opt/janus:/opt/janus 
+  -p 8088:8088 -p 8089:8089 -p 8188:8188 -p 7088:7088 -p 7089:7089 
+  -p 20000-20004:20000-20004/udp 
+  janus-runtime /opt/janus/bin/janus 
+    -F /opt/janus/etc/janus 
+    --rtp-port-range=20000-20004 
+    --stun-server=stun.l.google.com:19302 
     --nat-1-1=<YOUR_HOST_IP>

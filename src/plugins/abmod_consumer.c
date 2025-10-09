@@ -10,6 +10,7 @@
 #define QCAP 1024
 #define ITEM_EVENT 1
 #define ITEM_MIX 2
+#define ITEM_PUB 3
 
 typedef struct qitem_s {
     int type;
@@ -23,6 +24,9 @@ typedef struct qitem_s {
     /* Event */
     char event_name[16];
     char user_id[128];
+    /* Publish */
+    char *pub_event_name;
+    char *pub_payload;
 } qitem;
 
 struct abmod_consumer {
@@ -37,6 +41,14 @@ struct abmod_consumer {
     /* Active users */
     char **active;
     size_t active_len, active_cap;
+    /* Emitter */
+    abmod_consumer_emit_cb emit_cb;
+    void *emit_user;
+    /* Sample STT state */
+    int stt_active;
+    char stt_user[128];
+    uint64_t stt_frames_since_partial;
+    uint64_t stt_total_frames;
 };
 
 static void *consumer_thread(void *arg) {
@@ -53,7 +65,13 @@ static void *consumer_thread(void *arg) {
         c->head = (c->head + 1) % QCAP;
         c->size--;
         pthread_mutex_unlock(&c->mtx);
-        if(it.type == ITEM_EVENT) {
+        if(it.type == ITEM_PUB) {
+            if(c->emit_cb && it.pub_event_name) {
+                c->emit_cb(c->emit_user, it.pub_event_name, it.pub_payload);
+            }
+            if(it.pub_event_name) free(it.pub_event_name);
+            if(it.pub_payload) free(it.pub_payload);
+        } else if(it.type == ITEM_EVENT) {
             if(strcmp(it.event_name, "talking") == 0) {
                 int found = 0;
                 for(size_t i=0;i<c->active_len;i++) if(c->active[i] && strcmp(c->active[i], it.user_id) == 0) { found = 1; break; }
@@ -70,6 +88,11 @@ static void *consumer_thread(void *arg) {
                     c->active_len++;
                 }
                 fprintf(stderr, "[abmod] EVENT talk user=%s\n", it.user_id);
+                /* Start sample STT for this user */
+                c->stt_active = 1;
+                snprintf(c->stt_user, sizeof(c->stt_user), "%s", it.user_id);
+                c->stt_frames_since_partial = 0;
+                c->stt_total_frames = 0;
             } else {
                 for(size_t i=0;i<c->active_len;i++) if(c->active[i] && strcmp(c->active[i], it.user_id) == 0) {
                     free(c->active[i]);
@@ -79,6 +102,16 @@ static void *consumer_thread(void *arg) {
                     break;
                 }
                 fprintf(stderr, "[abmod] EVENT stop user=%s\n", it.user_id);
+                /* Finalize sample STT if active */
+                if(c->stt_active && strcmp(c->stt_user, it.user_id) == 0) {
+                    char payload[256];
+                    snprintf(payload, sizeof(payload), "{\"user\":\"%s\",\"text\":\"final-%" PRIu64 "\"}", c->stt_user, c->stt_total_frames);
+                    abmod_consumer_publish_final(c, payload);
+                }
+                c->stt_active = 0;
+                c->stt_user[0] = '\0';
+                c->stt_frames_since_partial = 0;
+                c->stt_total_frames = 0;
             }
         } else if(it.type == ITEM_MIX) {
             const char *side = "equal";
@@ -92,6 +125,17 @@ static void *consumer_thread(void *arg) {
             // } else {
             //     for(size_t i=0;i<c->active_len;i++) fprintf(stderr, "%s%s", c->active[i], (i+1<c->active_len)?",":"\n");
             // }
+            /* Emit sample partial transcripts periodically while talking */
+            if(c->stt_active && c->stt_user[0] != '\0') {
+                c->stt_frames_since_partial++;
+                c->stt_total_frames++;
+                if(c->stt_frames_since_partial >= 50) {
+                    c->stt_frames_since_partial = 0;
+                    char payload[256];
+                    snprintf(payload, sizeof(payload), "{\"user\":\"%s\",\"text\":\"partial-%" PRIu64 "\"}", c->stt_user, c->stt_total_frames);
+                    abmod_consumer_publish_partial(c, payload);
+                }
+            }
         }
     }
     return NULL;
@@ -123,6 +167,16 @@ void abmod_consumer_destroy(abmod_consumer *c) {
     pthread_mutex_destroy(&c->mtx);
     pthread_cond_destroy(&c->cv);
     free(c);
+}
+
+void abmod_consumer_set_emitter(abmod_consumer *c,
+        abmod_consumer_emit_cb cb,
+        void *user) {
+    if(!c) return;
+    pthread_mutex_lock(&c->mtx);
+    c->emit_cb = cb;
+    c->emit_user = user;
+    pthread_mutex_unlock(&c->mtx);
 }
 
 void abmod_consumer_enqueue_event(abmod_consumer *c, const char *event_name, const char *user_id) {
@@ -171,6 +225,35 @@ void abmod_consumer_enqueue_mix_pcm(abmod_consumer *c,
         pthread_cond_signal(&c->cv);
     }
     pthread_mutex_unlock(&c->mtx);
+}
+
+static void abmod_consumer_publish_(abmod_consumer *c,
+        const char *event_name,
+        const char *json_payload) {
+    if(!c || !event_name) return;
+    pthread_mutex_lock(&c->mtx);
+    if(c->size < QCAP) {
+        size_t pos = (c->head + c->size) % QCAP;
+        qitem *it = &c->queue[pos];
+        it->type = ITEM_PUB;
+        it->pub_event_name = strdup(event_name);
+        it->pub_payload = json_payload ? strdup(json_payload) : NULL;
+        c->size++;
+        pthread_cond_signal(&c->cv);
+    }
+    pthread_mutex_unlock(&c->mtx);
+}
+
+void abmod_consumer_publish_partial(abmod_consumer *c, const char *json_payload) {
+    abmod_consumer_publish_(c, "transcription.partial", json_payload);
+}
+
+void abmod_consumer_publish_final(abmod_consumer *c, const char *json_payload) {
+    abmod_consumer_publish_(c, "transcription.final", json_payload);
+}
+
+void abmod_consumer_publish_error(abmod_consumer *c, const char *json_payload) {
+    abmod_consumer_publish_(c, "transcription.error", json_payload);
 }
 
 

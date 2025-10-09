@@ -9821,24 +9821,59 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 	}
 }
 
-/* Custom module callback implementation: currently just logs and forwards as Janus event */
+/* Custom module callback implementation: broadcast to room participants and notify handlers */
 static void janus_audiobridge_abmod_emit_event(void *user,
         const char *event_name,
         const char *json_payload) {
-    janus_audiobridge_room *audiobridge = (janus_audiobridge_room *)user;
-    if(!audiobridge || !notify_events || !gateway->events_is_enabled())
-        return;
-    json_t *info = json_object();
-    json_object_set_new(info, "audiobridge", json_string(event_name ? event_name : "abmod"));
-    json_object_set_new(info, "room",
-        string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
-    if(json_payload) {
-        json_error_t jerr;
-        json_t *payload = json_loads(json_payload, 0, &jerr);
-        if(payload)
-            json_object_set_new(info, "payload", payload);
-    }
-    gateway->notify_event(&janus_audiobridge_plugin, NULL, info);
+	janus_audiobridge_room *audiobridge = (janus_audiobridge_room *)user;
+	if(!audiobridge)
+		return;
+
+	/* Build plugin event to broadcast to participants */
+	json_t *pub = json_object();
+	json_object_set_new(pub, "audiobridge", json_string("abmod"));
+	json_object_set_new(pub, "room",
+		string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
+	if(event_name)
+		json_object_set_new(pub, "event", json_string(event_name));
+	if(json_payload) {
+		json_error_t jerr;
+		json_t *payload = json_loads(json_payload, 0, &jerr);
+		if(payload)
+			json_object_set_new(pub, "payload", payload);
+	}
+
+	/* Broadcast to all participants in the room */
+	janus_mutex_lock(&audiobridge->mutex);
+	if(audiobridge->participants) {
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, audiobridge->participants);
+		while(g_hash_table_iter_next(&iter, NULL, &value)) {
+			janus_audiobridge_participant *p = value;
+			if(!p || !p->session || g_atomic_int_get(&p->paused_events))
+				continue;
+			int ret = gateway->push_event(p->session->handle, &janus_audiobridge_plugin, NULL, pub, NULL);
+			(void)ret;
+		}
+	}
+	janus_mutex_unlock(&audiobridge->mutex);
+	json_decref(pub);
+
+	/* Also notify event handlers for observability, if enabled */
+	if(notify_events && gateway->events_is_enabled()) {
+		json_t *info = json_object();
+		json_object_set_new(info, "audiobridge", json_string(event_name ? event_name : "abmod"));
+		json_object_set_new(info, "room",
+			string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
+		if(json_payload) {
+			json_error_t jerr;
+			json_t *payload = json_loads(json_payload, 0, &jerr);
+			if(payload)
+				json_object_set_new(info, "payload", payload);
+		}
+		gateway->notify_event(&janus_audiobridge_plugin, NULL, info);
+	}
 }
 
 #ifdef HAVE_RNNOISE

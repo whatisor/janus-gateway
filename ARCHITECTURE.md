@@ -38,8 +38,11 @@ The module is dynamically managed per room: it can be loaded, reloaded, or unloa
   - Talk detection hook (`janus_audiobridge_participant_istalking`):
     - Maintains `talk_version` (uint64) incremented on any talk state change.
     - On state change (talking/stopped-talking), call `abmod_on_event(ctx, event, room_id_str, user_id_str, event_time_us, talk_version)`.
-  - Upward events from module:
-    - `janus_audiobridge_abmod_emit_event` converts module-emitted events to Janus events (`gateway->notify_event`) with optional JSON payload.
+- Upward events from module:
+    - `janus_audiobridge_abmod_emit_event` now broadcasts module-emitted events to all room participants as plugin events, and also forwards them to Janus event handlers for observability.
+    - Client-facing event format:
+      - `{ "audiobridge": "abmod", "room": <room_id|room_id_str>, "event": <string>, "payload": <object?> }`
+      - Example: `{ "audiobridge": "abmod", "room": 1234, "event": "abmod.heartbeat", "payload": {"module":"template"} }`
   - Clean shutdown:
     - Room free path ensures `abmod_destroy` and `dlclose` are called and memory is freed.
 
