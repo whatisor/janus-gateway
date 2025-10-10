@@ -412,9 +412,19 @@ endif
 # Install it under lib/janus/abmodules so Janus won't auto-load it as a core plugin
 abmoduledir = $(libdir)/janus/abmodules
 abmodule_LTLIBRARIES = plugins/libabmod_transcriber_template.la
-plugins_libabmod_transcriber_template_la_SOURCES = plugins/abmod_transcriber_template.c plugins/abmod_consumer.c plugins/janus_ab_module.h plugins/abmod_consumer.h
-plugins_libabmod_transcriber_template_la_CFLAGS = $(plugins_cflags)
-plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version
+plugins_libabmod_transcriber_template_la_SOURCES = \
+    plugins/abmod_transcriber_template.c \
+    plugins/abmod_consumer.c \
+    plugins/janus_ab_module.h \
+    plugins/abmod_consumer.h \
+    plugins/audiobridge-deps/resample.c \
+    plugins/audiobridge-deps/arch.h \
+    plugins/audiobridge-deps/os_support.h \
+    plugins/audiobridge-deps/speex/speex_resampler.h \
+    plugins/audiobridge-deps/speex/speexdsp_types.h \
+    plugins/audiobridge-deps/speex/speexdsp_config_types.h
+plugins_libabmod_transcriber_template_la_CFLAGS = $(plugins_cflags) -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex -I$(top_srcdir)/src/plugins/audiobridge-deps/speex -I$(top_srcdir)/src/plugins/audiobridge-deps
+plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version $(WS_MANUAL_LIBS)
 plugins_libabmod_transcriber_template_la_LIBADD = $(plugins_libadd)
 
 if ENABLE_PLUGIN_ECHOTEST
