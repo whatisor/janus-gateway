@@ -82,15 +82,15 @@ docker run --rm -it
   janus-dev bash -lc "sh autogen.sh && ./configure --prefix=/opt/janus && make -j 10 && make install DESTDIR=/out && make configs || true"
 
 # Build runtime image
-
-
+docker build -t janus-runtime --target runtime .
 
 # Run with bind-mounted install
 docker run --rm -it `
   -v "${PWD}\out\opt\janus:/opt/janus" `
-  -p 8088:8088 -p 8089:8089 -p 8188:8188 -p 8989:8989 `
+  -p 8088:8088 -p 8089:8089 -p 8188:8188 -p 8989:8989 -p 8765:8765 `
   -p 20000-20004:20000-20004/udp `
   -e OPENAI_API_KEY=$env:OPENAI_API_KEY `
+  -e ABMOD_OPENAI_WS_URL=$env:ABMOD_OPENAI_WS_URL `
   janus-runtime /opt/janus/bin/janus `
     -F /opt/janus/etc/janus `
     --rtp-port-range=20000-20004 `

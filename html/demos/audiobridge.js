@@ -27,6 +27,74 @@ var webrtcUp = false;
 var audioenabled = false;
 var audiosuspended = (getQueryStringValue("suspended") !== "") ? (getQueryStringValue("suspended") === "true") : false;
 
+// STT conversation state
+var sttKnownUsers = {}; // id -> display
+var sttPartialItems = {}; // userKey -> <li> node for current partial
+function sttRememberUser(id, display) {
+  if(id !== undefined && id !== null) sttKnownUsers[String(id)] = display || ("User " + id);
+  if(display) sttKnownUsers[String(display)] = display; // allow lookup by display string too
+}
+function sttResolveName(userField) {
+  if(userField && sttKnownUsers[String(userField)]) return sttKnownUsers[String(userField)];
+  if(userField && /[^0-9]/.test(String(userField))) return String(userField); // looks like a name already
+  return null;
+}
+
+function sttNowTime() {
+  try {
+    return new Date().toLocaleTimeString();
+  } catch(e) {
+    return '';
+  }
+}
+function sttAppendMessage(user, text, isFinal) {
+  if(!text || !text.trim()) return;
+  const who = user || 'Unknown';
+  const li = document.createElement('li');
+  li.className = 'list-group-item';
+  const ts = sttNowTime();
+  li.innerHTML = (ts ? '<small class="text-muted">[' + escapeXmlTags(ts) + ']</small> ' : '') + '<strong>' + escapeXmlTags(who) + ':</strong> ' + escapeXmlTags(text);
+  if(isFinal) li.className += ' list-group-item-light';
+  const ul = document.getElementById('sttConversation');
+  if(ul) {
+    ul.appendChild(li);
+    // Scroll the surrounding card-body instead of the UL itself
+    const cont = ul.parentElement;
+    if(cont && cont.scrollTo) cont.scrollTo({ top: cont.scrollHeight, behavior: 'auto' });
+    else if(cont) cont.scrollTop = cont.scrollHeight;
+  }
+}
+
+function sttUpdatePartial(userKey, displayName, text) {
+  const ul = document.getElementById('sttConversation');
+  if(!ul) return;
+  if(!text || !text.trim()) return;
+  let li = sttPartialItems[userKey];
+  if(!li) {
+    li = document.createElement('li');
+    li.className = 'list-group-item';
+    sttPartialItems[userKey] = li;
+    ul.appendChild(li);
+  }
+  const ts = sttNowTime();
+  li.innerHTML = (ts ? '<small class="text-muted">[' + escapeXmlTags(ts) + ']</small> ' : '') + '<strong>' + escapeXmlTags(displayName || userKey || 'Unknown') + ':</strong> ' + escapeXmlTags(text) + ' <em class="text-muted">(partial)</em>';
+  const cont = ul.parentElement;
+  if(cont && cont.scrollTo) cont.scrollTo({ top: cont.scrollHeight, behavior: 'auto' });
+  else if(cont) cont.scrollTop = cont.scrollHeight;
+}
+
+function sttFinalize(userKey, displayName, text) {
+  const ul = document.getElementById('sttConversation');
+  if(!ul) return;
+  const finalText = (text && text.trim()) ? text : (sttPartialItems[userKey] ? sttPartialItems[userKey].textContent.replace(/^.*?:\s*/, '') : '');
+  // Remove partial row (we will append a new final row to keep full history)
+  if(sttPartialItems[userKey]) {
+    try { ul.removeChild(sttPartialItems[userKey]); } catch(e) {}
+    delete sttPartialItems[userKey];
+  }
+  if(finalText) sttAppendMessage(displayName || userKey || 'Unknown', finalText, true);
+}
+
 
 $(document).ready(function() {
 	// Initialize the library (all console debuggers enabled)
@@ -107,6 +175,28 @@ $(document).ready(function() {
 									let event = msg["audiobridge"];
 									Janus.debug("Event: " + event);
 									if(event) {
+										// Handle custom AudioBridge module (ABMod) notifications for STT
+										if(event === "abmod") {
+											// Expected payload shape:
+											// { audiobridge: "abmod", room, event: "transcription.partial|final|error", payload: { user, text } }
+											let sttType = msg["event"];
+											let payload = msg["payload"] || {};
+                                            let userField = payload.user || "";
+                                            // Resolve display name: try id->display mapping, then direct name, then fallback
+                                            let who = sttResolveName(userField) || myusername || "Speaker";
+											// Update status
+											$("#sttStatus").text(sttType === "transcription.final" ? "final" : "listening…");
+                                            // Use stable key by participant id when available, else by resolved name
+                                            const userKey = (payload.user && sttKnownUsers[String(payload.user)]) ? String(payload.user) : String(who);
+											if(sttType === 'transcription.partial') {
+												sttUpdatePartial(userKey, who, payload.text || '');
+											} else if(sttType === 'transcription.final') {
+												sttFinalize(userKey, who, payload.text || '');
+											} else if(sttType === 'transcription.error') {
+												if(payload.text) sttAppendMessage(who, payload.text, true);
+											}
+											return; // Don't process further as regular audiobridge events
+										}
 										if(event === "joined") {
 											// Successfully joined, negotiate WebRTC now
 											if(msg["id"]) {
@@ -167,6 +257,7 @@ $(document).ready(function() {
 												for(let f in list) {
 													let id = list[f]["id"];
 													let display = escapeXmlTags(list[f]["display"]);
+                                            sttRememberUser(id, display);
 													let setup = list[f]["setup"];
 													let muted = list[f]["muted"];
 													let suspended = list[f]["suspended"];
@@ -217,6 +308,7 @@ $(document).ready(function() {
 												for(let f in list) {
 													let id = list[f]["id"];
 													let display = escapeXmlTags(list[f]["display"]);
+                                                sttRememberUser(id, display);
 													let setup = list[f]["setup"];
 													let muted = list[f]["muted"];
 													let suspended = list[f]["suspended"];
@@ -272,6 +364,7 @@ $(document).ready(function() {
 												for(let f in list) {
 													let id = list[f]["id"];
 													let display = escapeXmlTags(list[f]["display"]);
+                                                    sttRememberUser(id, display);
 													let setup = list[f]["setup"];
 													let muted = list[f]["muted"];
 													let suspended = list[f]["suspended"];

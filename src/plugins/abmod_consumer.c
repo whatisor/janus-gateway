@@ -238,10 +238,26 @@ abmod_consumer *abmod_consumer_create(uint32_t sampling_rate, int channels) {
     const char *url = c->cfg_ws_url;
     c->ws->use_ssl = (strncmp(url, "wss://", 6) == 0); int offset = c->ws->use_ssl ? 6 : (strncmp(url, "ws://", 5)==0 ? 5 : 0);
     const char *host_start = url + offset;
-    const char *slash = strchr(host_start, '/');
-    size_t host_len = slash ? (size_t)(slash - host_start) : strlen(host_start);
-    if(host_len >= sizeof(c->ws->host)) host_len = sizeof(c->ws->host)-1;
-    memcpy(c->ws->host, host_start, host_len); c->ws->host[host_len] = '\0';
+	const char *slash = strchr(host_start, '/');
+	/* Extract host[:port] segment */
+	size_t host_len = slash ? (size_t)(slash - host_start) : strlen(host_start);
+	/* Split optional :port from host */
+	const char *colon = NULL;
+	for(size_t i = 0; i < host_len; ++i) {
+		if(host_start[i] == ':') { colon = host_start + i; break; }
+	}
+	if(colon != NULL) {
+		/* Copy host without :port */
+		size_t name_len = (size_t)(colon - host_start);
+		if(name_len >= sizeof(c->ws->host)) name_len = sizeof(c->ws->host) - 1;
+		memcpy(c->ws->host, host_start, name_len);
+		c->ws->host[name_len] = '\0';
+	} else {
+		/* No explicit port, copy whole host segment */
+		if(host_len >= sizeof(c->ws->host)) host_len = sizeof(c->ws->host) - 1;
+		memcpy(c->ws->host, host_start, host_len);
+		c->ws->host[host_len] = '\0';
+	}
     /* Preserve full path including query (?intent=...) if present */
     if(slash && *slash) {
         snprintf(c->ws->path, sizeof(c->ws->path), "%s", slash);
@@ -249,7 +265,12 @@ abmod_consumer *abmod_consumer_create(uint32_t sampling_rate, int channels) {
         /* Fallback to transcription-specific endpoint */
         snprintf(c->ws->path, sizeof(c->ws->path), "/v1/realtime?intent=transcription");
     }
-    c->ws->port = c->ws->use_ssl ? 443 : 80;
+	/* Default port based on scheme, may be overridden by explicit :port */
+	c->ws->port = c->ws->use_ssl ? 443 : 80;
+	if(colon != NULL) {
+		int p = atoi(colon + 1);
+		if(p > 0 && p < 65536) c->ws->port = p;
+	}
     
     /* Detect if using transcription intent mode */
     c->ws->transcription_mode = (strstr(c->ws->path, "intent=transcription") != NULL);

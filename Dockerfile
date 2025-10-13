@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl python3 meson ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
+# Ensure pkg-config can find libs installed to common prefixes
+ENV PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH}"
+
 # Build and install libnice (recommended newer version)
 RUN git clone https://gitlab.freedesktop.org/libnice/libnice /tmp/libnice \
     && cd /tmp/libnice \
@@ -28,6 +31,16 @@ RUN cd /tmp \
     && make install \
     && rm -rf /tmp/libsrtp-*
 
+# Build and install RNNoise (for HAVE_RNNOISE / post-processing)
+RUN git clone https://github.com/xiph/rnnoise.git /tmp/rnnoise \
+    && cd /tmp/rnnoise \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr \
+    && make -j"$(nproc)" \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/rnnoise
+
 WORKDIR /work
 
 # Usage (example):
@@ -35,7 +48,7 @@ WORKDIR /work
 #  docker run --rm -it \
 #    -v $PWD:/work \
 #    -v $PWD/out:/out \
-#    janus-dev bash -lc "sh autogen.sh && ./configure --prefix=/opt/janus && make -j$(nproc) && make install DESTDIR=/out && make configs || true"
+#    janus-dev bash -lc "sh autogen.sh && ./configure --prefix=/opt/janus --enable-post-processing && make -j$(nproc) && make install DESTDIR=/out && make configs || true"
 
 # Stage 2: runtime
 FROM debian:bookworm-slim AS runtime
@@ -48,8 +61,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libconfig9 libssl3 libogg0 libopus0 libsrtp2-1 libnice10 libcurl4 zlib1g libwebsockets17 \
     && rm -rf /var/lib/apt/lists/*
 
-# libnice and libsrtp runtime libs from dev image (built from source)
-## No need to copy shared libs from dev: installed via apt in runtime
+# Bring RNNoise shared library from dev stage (built from source)
+# Try both common prefixes to be safe
+COPY --from=dev /usr/lib/librnnoise.so* /usr/lib/
+COPY --from=dev /usr/local/lib/librnnoise.so* /usr/local/lib/
 
 # Expect Janus installation to be bind-mounted at runtime (from /out/opt/janus)
 # Example:
