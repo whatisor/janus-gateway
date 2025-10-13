@@ -34,8 +34,7 @@ The module is dynamically managed per room: it can be loaded, reloaded, or unloa
     - On unload or room teardown, call `abmod_destroy` and `dlclose`.
   - Mixer hook (`janus_audiobridge_mixer_thread`):
     - Maintains `frame_seq` (uint64) incremented per frame and uses the mixer RTP `timestamp` (`rtp_timestamp`).
-    - After building the mixed PCM frame (`outBuffer`), call `abmod_on_mix(ctx, outBuffer, samples, rate, channels, rtp_timestamp, frame_seq)` whenever participants are present.
-  - Talk detection hook (`janus_audiobridge_participant_istalking`):
+    - After building the mixed PCM frame (`outBuffer`), call `abmod_on_mix(ctx, outBuffer, samples, rate, channels, rtp_timestamp, frame_seq, active_talk_version)` whenever participants are present.  - Talk detection hook (`janus_audiobridge_participant_istalking`):
     - Maintains `talk_version` (uint64) incremented on any talk state change.
     - On state change (talking/stopped-talking), call `abmod_on_event(ctx, event, room_id_str, user_id_str, event_time_us, talk_version)`.
 - Upward events from module:

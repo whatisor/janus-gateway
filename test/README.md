@@ -76,9 +76,10 @@ docker run --rm -it `
 docker build -t janus-dev --target dev .
 
 # Build with bind-mounts (source and output)
-docker run --rm -it 
-  -v ${PWD}:/work 
-  -v ${PWD}/out:/out 
+# Build with bind-mounts (source and output)
+docker run --rm -it `
+  -v ${PWD}:/work `
+  -v ${PWD}/out:/out `
   janus-dev bash -lc "sh autogen.sh && ./configure --prefix=/opt/janus && make -j 10 && make install DESTDIR=/out && make configs || true"
 
 # Build runtime image
