@@ -7341,10 +7341,13 @@ static void *janus_audiobridge_handler(void *data) {
 				janus_audiobridge_room *audiobridge = participant->room;
 				if(audiobridge) {
 					janus_mutex_lock(&audiobridge->mutex);
-					/* unload previous if any */
+					/* dont unload previous if any */
 					if(audiobridge->abmod_ctx && audiobridge->abmod_destroy) {
-						audiobridge->abmod_destroy(audiobridge->abmod_ctx);
-						audiobridge->abmod_ctx = NULL;
+						janus_mutex_unlock(&audiobridge->mutex);
+						janus_mutex_unlock(&rooms_mutex);
+						continue;
+						//audiobridge->abmod_destroy(audiobridge->abmod_ctx);
+						//audiobridge->abmod_ctx = NULL;
 					}
 					if(audiobridge->abmod_lib) {
 						dlclose(audiobridge->abmod_lib);
