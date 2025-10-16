@@ -69,8 +69,9 @@ typedef struct ws_client_s {
     struct abmod_consumer *owner;
 } ws_client;
 
-#define AUDIO_RING_CAP_SAMPLES (24000*10) /* 10s at 24k mono */
-#define WS_CHUNK_SAMPLES_24K   (2400)     /* 100ms at 24kHz */
+#define OPENAI_INPUT_RATE 24000
+#define AUDIO_RING_CAP_SAMPLES (OPENAI_INPUT_RATE*10) /* 10s at OPENAI_INPUT_RATE mono */
+#define WS_CHUNK_SAMPLES   (OPENAI_INPUT_RATE/10)     /* 100ms at OPENAI_INPUT_RATE */
 
 struct abmod_consumer {
     uint32_t rate;
@@ -118,7 +119,7 @@ static void *ws_thread(void *arg);
 static int ws_lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 static void ws_enqueue(ws_client *ws, const char *json_text);
 static void ws_send_session_update(ws_client *ws, const char *instructions);
-static void ws_send_audio_append(ws_client *ws, const void *pcm16_24k, size_t samples);
+static void ws_send_audio_append(ws_client *ws, const void *pcm16, size_t samples);
 static void ws_send_commit_and_request(ws_client *ws);
 static void consumer_publish_partial(struct abmod_consumer *c, const char *user, const char *text);
 static void consumer_publish_final(struct abmod_consumer *c, const char *user, const char *text);
@@ -220,9 +221,9 @@ abmod_consumer *abmod_consumer_create(uint32_t sampling_rate, int channels) {
     /* Audio ring */
     c->a_cap = AUDIO_RING_CAP_SAMPLES;
     c->a_ring = (int16_t*)calloc(c->a_cap, sizeof(int16_t));
-    /* Resampler for input-rate -> 24k mono (required by OpenAI) */
+    /* Resampler for input-rate -> target mono (required by OpenAI) */
     int err = 0;
-    c->resampler = speex_resampler_init(1, sampling_rate, 24000, SPEEX_RESAMPLER_QUALITY_VOIP, &err);
+    c->resampler = speex_resampler_init(1, sampling_rate, OPENAI_INPUT_RATE, SPEEX_RESAMPLER_QUALITY_VOIP, &err);
     if(!c->resampler || err != RESAMPLER_ERR_SUCCESS) {
         fprintf(stderr, "[abmod] Failed to init resampler (err=%d)\n", err);
     }
@@ -469,7 +470,7 @@ void abmod_consumer_publish_error(abmod_consumer *c, const char *json_payload) {
  * 
  * Message flow:
  * 1. Connect and send transcription_session.update / session.update
- * 2. Stream audio via input_audio_buffer.append (base64-encoded PCM16 @ 24kHz)
+ * 2. Stream audio via input_audio_buffer.append (base64-encoded PCM16 @ target Hz)
  * 3. Receive transcription deltas and completed events
  */
 
@@ -565,13 +566,14 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
         /* Session configuration sent */
     }
     
+    fprintf(stderr, "[abmod] WS session update request: %s\n", buf);
     ws_enqueue(ws, buf);
 }
 
-static void ws_send_audio_append(ws_client *ws, const void *pcm16_24k, size_t samples) {
-    if(!ws || !pcm16_24k || samples == 0) return;
+static void ws_send_audio_append(ws_client *ws, const void *pcm16, size_t samples) {
+    if(!ws || !pcm16 || samples == 0) return;
     size_t bytes = samples * sizeof(int16_t);
-    char *b64 = (char*)g_base64_encode((const guchar*)pcm16_24k, bytes);
+    char *b64 = (char*)g_base64_encode((const guchar*)pcm16, bytes);
     if(!b64) return;
     size_t json_cap = strlen(b64) + 64;
     char *json = (char*)malloc(json_cap);
@@ -661,6 +663,9 @@ static void ws_process_incoming(ws_client *ws, const char *msg, size_t len) {
     } else if(type && strcmp(type, "error")==0) {
         const char *err_msg = json_string_value(json_object_get(json_object_get(root, "error"), "message"));
         fprintf(stderr, "[abmod] ERROR: %s\n", err_msg ? err_msg : "(unknown)");
+    } else if(type && strstr(type, "failed")) {
+        /* Log full raw inbound JSON if type includes "failed" */
+        fprintf(stderr, "[abmod] ERROR: %s\n", msg);
     }
     /* Other event types are silently ignored */
     json_decref(root);
@@ -759,6 +764,7 @@ static int ws_lws_callback(struct lws *wsi, enum lws_callback_reasons reason, vo
                 if(n < 0) break;
                 if(n == 0) break;
             } while(1);
+            fprintf(stderr, "[abmod] WS HTTP body: %s\n", bp);
             return 0;
         }
         case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
@@ -820,7 +826,7 @@ static void *ws_thread(void *arg) {
         fprintf(stderr, "[abmod] Failed to create lws context\n");
         return NULL;
     }
-    lws_set_log_level(LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_CLIENT | LLL_HEADER, abmod_lws_log_emit);
+    //lws_set_log_level(LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_CLIENT | LLL_HEADER, abmod_lws_log_emit);
     while(c->ws_running) {
         if(!ws->connected && ws->wsi == NULL) {
             /* Throttle connection attempts */
@@ -871,9 +877,9 @@ static void *ws_thread(void *arg) {
             pthread_mutex_unlock(&c->a_mtx);
             in_len = (spx_uint32_t)take;
             if(in_len > 0 && c->resampler && ws->connected) {
-                /* Resample to 24kHz (required by OpenAI) */
-                int16_t out_buf[WS_CHUNK_SAMPLES_24K*4];
-                spx_uint32_t out_len = WS_CHUNK_SAMPLES_24K*4;
+                /* Resample to WS_CHUNK_SAMPLES (required by OpenAI) */
+                int16_t out_buf[WS_CHUNK_SAMPLES*4];
+                spx_uint32_t out_len = WS_CHUNK_SAMPLES*4;
                 speex_resampler_process_int(c->resampler, 0, in_buf, &in_len, out_buf, &out_len);
                 if(out_len > 0) {
                     ws_send_audio_append(ws, out_buf, out_len);
