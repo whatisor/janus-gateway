@@ -11,7 +11,8 @@
 
 #include "abmod_consumer.h"
 
-#define QCAP 1024
+// Max 3 seconds of audio latency.
+#define QCAP 300
 #define ITEM_EVENT 1
 #define ITEM_MIX 2
 #define ITEM_PUB 3
@@ -70,7 +71,7 @@ typedef struct ws_client_s {
 } ws_client;
 
 #define OPENAI_INPUT_RATE 24000
-#define AUDIO_RING_CAP_SAMPLES (OPENAI_INPUT_RATE*10) /* 10s at OPENAI_INPUT_RATE mono */
+#define AUDIO_RING_CAP_SAMPLES (OPENAI_INPUT_RATE*3) /* 3s at OPENAI_INPUT_RATE mono */
 #define WS_CHUNK_SAMPLES   (OPENAI_INPUT_RATE/10)     /* 100ms at OPENAI_INPUT_RATE */
 
 struct abmod_consumer {
@@ -384,10 +385,15 @@ void abmod_consumer_enqueue_mix_pcm(abmod_consumer *c,
                 size_t idx = (c->a_head + c->a_len) % c->a_cap;
                 c->a_ring[idx] = m;
                 c->a_len++;
+                if(c->a_len % 240000 == 0) { /* Log every 10 second of audio */
+                    fprintf(stderr, "[abmod] 🎵 Audio buffer: %zu/%zu samples (%.1fs)\n", 
+                            c->a_len, c->a_cap, (double)c->a_len / OPENAI_INPUT_RATE);
+                }
             } else {
                 /* Drop oldest */
                 c->a_ring[c->a_head] = m;
                 c->a_head = (c->a_head + 1) % c->a_cap;
+                //fprintf(stderr, "[abmod] ⚠️ Audio buffer full, dropping samples\n");
             }
         }
         pthread_cond_signal(&c->a_cv);
@@ -579,7 +585,7 @@ static void ws_send_audio_append(ws_client *ws, const void *pcm16, size_t sample
     char *json = (char*)malloc(json_cap);
     snprintf(json, json_cap, "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}", b64);
     ws_enqueue(ws, json);
-    /* Verbose logging removed - audio is continuously streaming */
+    //fprintf(stderr, "[abmod] 📡 Sending audio chunk: %zu samples (%zu bytes)\n", samples, bytes);
     g_free(b64);
     free(json);
 }
@@ -680,7 +686,7 @@ static int ws_lws_callback(struct lws *wsi, enum lws_callback_reasons reason, vo
             ws->connected = 1;
             ws->backoff_ms = 10000; 
             ws->next_connect_us = 0;
-            fprintf(stderr, "[abmod] Connected to OpenAI Realtime endpoint (host=%s path=%s)\n", ws->host, ws->path);
+            fprintf(stderr, "[abmod] ✅ Connected to OpenAI Realtime endpoint (host=%s path=%s)\n", ws->host, ws->path);
             /* Send appropriate session update based on mode */
             if(ws->transcription_mode) {
                 ws_send_session_update(ws, NULL);
@@ -885,6 +891,9 @@ static void *ws_thread(void *arg) {
                     ws_send_audio_append(ws, out_buf, out_len);
                     c->samples_since_commit += out_len;
                 }
+            } else if(in_len > 0) {
+                //fprintf(stderr, "[abmod] 🔍 Audio available but not sending: resampler=%p, connected=%d\n", 
+                //        c->resampler, ws->connected);
             }
         }
         lws_service(ws->ctx, 10);
@@ -899,7 +908,9 @@ static void consumer_publish_partial(struct abmod_consumer *c, const char *user,
     char *payload = NULL;
     size_t cap = strlen(user) + strlen(text) + 64;
     payload = (char*)malloc(cap);
-    snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_dumps(json_string(text), JSON_ENCODE_ANY));
+    char *json_text = json_dumps(json_string(text), JSON_ENCODE_ANY);
+    snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_text);
+    free(json_text);
     abmod_consumer_publish_partial(c, payload);
     free(payload);
 }
@@ -909,7 +920,9 @@ static void consumer_publish_final(struct abmod_consumer *c, const char *user, c
     char *payload = NULL;
     size_t cap = strlen(user) + strlen(text) + 64;
     payload = (char*)malloc(cap);
-    snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_dumps(json_string(text), JSON_ENCODE_ANY));
+    char *json_text = json_dumps(json_string(text), JSON_ENCODE_ANY);
+    snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_text);
+    free(json_text);
     abmod_consumer_publish_final(c, payload);
     free(payload);
 }
