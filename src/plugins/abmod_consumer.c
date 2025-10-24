@@ -539,7 +539,7 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
           "{\"type\":\"transcription_session.update\",\"session\":{"
           "\"input_audio_format\":\"pcm16\","
           "\"input_audio_transcription\":%s,"
-          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":500}%s"
+          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":150}%s"
           "}}",
           transcription_json,
           noise_json
@@ -562,7 +562,7 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
           "\"input_audio_format\":\"pcm16\","
           "\"output_audio_format\":\"pcm16\","
           "\"input_audio_transcription\":{\"model\":\"%s\"%s%s},"
-          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":500},"
+          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":150},"
           "\"instructions\":\"You are a transcription assistant. Transcribe the audio accurately.\""
           "}}",
           model,
