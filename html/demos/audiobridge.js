@@ -29,15 +29,54 @@ var audiosuspended = (getQueryStringValue("suspended") !== "") ? (getQueryString
 
 // STT conversation state
 var sttKnownUsers = {}; // id -> display
-var sttPartialItems = {}; // userKey -> <li> node for current partial
+var sttPartialItems = {}; // item_id -> { userKey, displayName, text, li }
+var sttCurrentItemId = null; // Track current item_id for accumulation
 function sttRememberUser(id, display) {
   if(id !== undefined && id !== null) sttKnownUsers[String(id)] = display || ("User " + id);
   if(display) sttKnownUsers[String(display)] = display; // allow lookup by display string too
 }
 function sttResolveName(userField) {
-  if(userField && sttKnownUsers[String(userField)]) return sttKnownUsers[String(userField)];
-  if(userField && /[^0-9]/.test(String(userField))) return String(userField); // looks like a name already
-  return null;
+  // First try to look up in known users mapping
+  if(userField && sttKnownUsers[String(userField)]) {
+    return sttKnownUsers[String(userField)];
+  }
+  // Ensure local own id resolves to own display name even if mapping isn't ready
+  if(userField && typeof myid !== 'undefined' && myid !== null && String(userField) === String(myid) && myusername) {
+    return myusername;
+  }
+  // Otherwise, assume it's already a display name
+  return String(userField);
+}
+
+function sttResolveUsers(userField, fallbackName) {
+  // Handle multiple user IDs split by comma
+  let userIds = String(userField).split(',').map(id => id.trim()).filter(id => id);
+  let userKeys = [];
+  let displayNames = [];
+  
+  for(let userId of userIds) {
+    userKeys.push(String(userId));
+    let displayName = sttResolveName(userId);
+    // Map local participant ID to its display name immediately
+    if(!displayName && typeof myid !== 'undefined' && myid !== null && String(userId) === String(myid) && myusername) {
+      displayName = myusername;
+    }
+    if(!displayName) {
+      // If not found, check if it looks like an ID vs a name
+      if(userId && /^[0-9]+$/.test(String(userId))) {
+        displayName = "User " + String(userId);
+      } else {
+        displayName = String(userId) || "Unknown";
+      }
+    }
+    displayNames.push(displayName);
+  }
+  
+  // Combine into display strings
+  let userKey = userKeys.join(',');
+  let who = displayNames.length > 0 ? displayNames.join(', ') : (fallbackName || "Speaker");
+  
+  return { userKey, who };
 }
 
 function sttNowTime() {
@@ -65,34 +104,66 @@ function sttAppendMessage(user, text, isFinal) {
   }
 }
 
-function sttUpdatePartial(userKey, displayName, text) {
+function sttUpdatePartial(itemId, userKey, displayName, text) {
   const ul = document.getElementById('sttConversation');
   if(!ul) return;
   if(!text || !text.trim()) return;
-  let li = sttPartialItems[userKey];
-  if(!li) {
-    li = document.createElement('li');
-    li.className = 'list-group-item';
-    sttPartialItems[userKey] = li;
+  
+  // Use item_id as the key for tracking partial messages
+  const key = itemId || 'unknown_item';
+  let partialItem = sttPartialItems[key];
+  
+  if(!partialItem) {
+    // Create new partial item
+    const li = document.createElement('li');
+    li.className = 'list-group-item list-group-item-info';
+    li.style.opacity = '0.7';
+    partialItem = {
+      userKey: userKey,
+      displayName: displayName,
+      text: '',
+      li: li
+    };
+    sttPartialItems[key] = partialItem;
     ul.appendChild(li);
   }
+  
+  // Accumulate text (replace previous partial text)
+  partialItem.text = text;
+  partialItem.displayName = displayName || partialItem.displayName;
+  
   const ts = sttNowTime();
-  li.innerHTML = (ts ? '<small class="text-muted">[' + escapeXmlTags(ts) + ']</small> ' : '') + '<strong>' + escapeXmlTags(displayName || userKey || 'Unknown') + ':</strong> ' + escapeXmlTags(text) + ' <em class="text-muted">(partial)</em>';
+  partialItem.li.innerHTML = (ts ? '<small class="text-muted">[' + escapeXmlTags(ts) + ']</small> ' : '') + 
+    '<strong>' + escapeXmlTags(partialItem.displayName || userKey || 'Unknown') + ':</strong> ' + 
+    escapeXmlTags(text) + ' <em class="text-muted">(partial)</em>';
+  
   const cont = ul.parentElement;
   if(cont && cont.scrollTo) cont.scrollTo({ top: cont.scrollHeight, behavior: 'auto' });
   else if(cont) cont.scrollTop = cont.scrollHeight;
 }
 
-function sttFinalize(userKey, displayName, text) {
+function sttFinalize(itemId, userKey, displayName, text) {
   const ul = document.getElementById('sttConversation');
   if(!ul) return;
-  const finalText = (text && text.trim()) ? text : (sttPartialItems[userKey] ? sttPartialItems[userKey].textContent.replace(/^.*?:\s*/, '') : '');
-  // Remove partial row (we will append a new final row to keep full history)
-  if(sttPartialItems[userKey]) {
-    try { ul.removeChild(sttPartialItems[userKey]); } catch(e) {}
-    delete sttPartialItems[userKey];
+  
+  const key = itemId || 'unknown_item';
+  const partialItem = sttPartialItems[key];
+  
+  // Use provided text or accumulated partial text
+  const finalText = (text && text.trim()) ? text : (partialItem ? partialItem.text : '');
+  
+  // Remove partial row if it exists
+  if(partialItem && partialItem.li) {
+    try { 
+      ul.removeChild(partialItem.li); 
+    } catch(e) {}
+    delete sttPartialItems[key];
   }
-  if(finalText) sttAppendMessage(displayName || userKey || 'Unknown', finalText, true);
+  
+  // Add final message if we have text
+  if(finalText) {
+    sttAppendMessage(displayName || (partialItem ? partialItem.displayName : userKey) || 'Unknown', finalText, true);
+  }
 }
 
 
@@ -176,31 +247,35 @@ $(document).ready(function() {
 									Janus.debug("Event: " + event);
 									if(event) {
 										// Handle custom AudioBridge module (ABMod) notifications for STT
-										if(event === "abmod") {
-											// Expected payload shape:
-											// { audiobridge: "abmod", room, event: "transcription.partial|final|error", payload: { user, text } }
-											let sttType = msg["event"];
-											let payload = msg["payload"] || {};
-                                            let userField = payload.user || "";
-                                            // Resolve display name: try id->display mapping, then direct name, then fallback
-                                            let who = sttResolveName(userField) || myusername || "Speaker";
-											// Update status
-											$("#sttStatus").text(sttType === "transcription.final" ? "final" : "listening…");
-                                            // Use stable key by participant id when available, else by resolved name
-                                            const userKey = (payload.user && sttKnownUsers[String(payload.user)]) ? String(payload.user) : String(who);
-											if(sttType === 'transcription.partial') {
-												sttUpdatePartial(userKey, who, payload.text || '');
-											} else if(sttType === 'transcription.final') {
-												sttFinalize(userKey, who, payload.text || '');
-											} else if(sttType === 'transcription.error') {
-												if(payload.text) sttAppendMessage(who, payload.text, true);
-											}
-											return; // Don't process further as regular audiobridge events
+									if(event === "abmod") {
+										// Expected payload shape:
+										// { audiobridge: "abmod", room, event: "transcription.partial|final|error", payload: { user, text, item_id } }
+										let sttType = msg["event"];
+										let payload = msg["payload"] || {};
+										let userField = payload.user || "";
+										let itemId = payload.item_id || null;
+										
+										// Resolve multiple user IDs to display names
+										let { userKey, who } = sttResolveUsers(userField, myusername);
+										
+										// Update status
+										$("#sttStatus").text(sttType === "transcription.final" ? "final" : "listening…");
+										
+										if(sttType === 'transcription.partial') {
+											sttUpdatePartial(itemId, userKey, who, payload.text || '');
+										} else if(sttType === 'transcription.final') {
+											sttFinalize(itemId, userKey, who, payload.text || '');
+										} else if(sttType === 'transcription.error') {
+											if(payload.text) sttAppendMessage(who, payload.text, true);
 										}
+										return; // Don't process further as regular audiobridge events
+									}
 										if(event === "joined") {
 											// Successfully joined, negotiate WebRTC now
 											if(msg["id"]) {
-												myid = msg["id"];
+													myid = msg["id"];
+													// Map our own id to display name immediately
+													try { if(myusername) sttRememberUser(myid, myusername); } catch(e) {}
 												Janus.log("Successfully joined room " + msg["room"] + " with ID " + myid);
 												if(!webrtcUp) {
 													webrtcUp = true;
@@ -294,7 +369,25 @@ $(document).ready(function() {
 														$('#rp' + id + ' > i.absusp').addClass('hide');
 													if(spatial !== null && spatial !== undefined)
 														$('#sp' + id).slider('setValue', spatial);
-												}
+											}
+											// Ensure local client appears in the participants list
+											if(myid && myusername && $('#rp' + myid).length === 0) {
+												$('#list').append('<li id="rp' + myid +'" class="list-group-item">' +
+													escapeXmlTags(myusername) +
+													' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
+													' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
+													' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
+												$('#rp' + myid + ' > i').addClass('hide');
+											}
+											// Ensure local client appears in the participants list
+											if(myid && myusername && $('#rp' + myid).length === 0) {
+												$('#list').append('<li id="rp' + myid +'" class="list-group-item">' +
+													escapeXmlTags(myusername) +
+													' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
+													' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
+													' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
+												$('#rp' + myid + ' > i').addClass('hide');
+											}
 											}
 										} else if(event === "roomchanged") {
 											// The user switched to a different room
@@ -346,6 +439,25 @@ $(document).ready(function() {
 													if(spatial !== null && spatial !== undefined)
 														$('#sp' + id).slider('setValue', spatial);
 												}
+												// Ensure local client appears in the participants list
+												if(myid && myusername && $('#rp' + myid).length === 0) {
+													$('#list').append('<li id="rp' + myid +'" class="list-group-item">' +
+														escapeXmlTags(myusername) +
+														' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
+														' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
+														' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
+													$('#rp' + myid + ' > i').addClass('hide');
+												}
+											}
+											// Ensure local client appears in the participants list
+											if(myid && myusername && $('#rp' + myid).length === 0) {
+												$('#list').append('<li id="rp' + myid +'" class="list-group-item">' +
+													escapeXmlTags(myusername) +
+													' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
+													' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
+													' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
+
+												$('#rp' + myid + ' > i').addClass('hide');
 											}
 										} else if(event === "destroyed") {
 											// The room has been destroyed

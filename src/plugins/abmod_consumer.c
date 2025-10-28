@@ -16,6 +16,7 @@
 #define ITEM_EVENT 1
 #define ITEM_MIX 2
 #define ITEM_PUB 3
+#define SILENCE_THRESHOLD 300
 
 typedef struct qitem_s {
     int type;
@@ -73,6 +74,7 @@ typedef struct ws_client_s {
 #define OPENAI_INPUT_RATE 24000
 #define AUDIO_RING_CAP_SAMPLES (OPENAI_INPUT_RATE*3) /* 3s at OPENAI_INPUT_RATE mono */
 #define WS_CHUNK_SAMPLES   (OPENAI_INPUT_RATE/10)     /* 100ms at OPENAI_INPUT_RATE */
+/* No utterance debounce; attribution uses current stt_user or stt_user_last */
 
 struct abmod_consumer {
     uint32_t rate;
@@ -92,6 +94,7 @@ struct abmod_consumer {
     /* STT state */
     int stt_active;
     char stt_user[128];
+    char stt_user_last[128];
     /* Audio ring (mono at input rate) */
     pthread_mutex_t a_mtx;
     pthread_cond_t a_cv;
@@ -129,6 +132,31 @@ static void consumer_publish_final(struct abmod_consumer *c, const char *user, c
 static void str_assign(char **dst, const char *src) {
     if(*dst) { free(*dst); *dst = NULL; }
     if(src) *dst = strdup(src);
+}
+
+/* Build stt_user from active speakers list */
+static void rebuild_stt_user(struct abmod_consumer *c) {
+    c->stt_user[0] = '\0';
+    size_t offset = 0;
+    for(size_t i = 0; i < c->active_len; i++) {
+        if(c->active[i]) {
+            size_t len = strlen(c->active[i]);
+            if(offset + len + 2 < sizeof(c->stt_user)) {  // +2 for comma and null terminator
+                if(offset > 0) {
+                    c->stt_user[offset++] = ',';
+                }
+                memcpy(c->stt_user + offset, c->active[i], len);
+                offset += len;
+                c->stt_user[offset] = '\0';
+            } else {
+                break;  // No more space
+            }
+        }
+    }
+    /* If new stt_user became empty but previously we had a value and transcription is active, keep last */
+    if(c->stt_active && c->stt_user[0] == '\0' && c->stt_user_last[0] != '\0') {
+        snprintf(c->stt_user, sizeof(c->stt_user), "%s", c->stt_user_last);
+    }
 }
 
 static void *consumer_thread(void *arg) {
@@ -169,7 +197,11 @@ static void *consumer_thread(void *arg) {
                 }
                 /* User started talking - track for transcription attribution */
                 c->stt_active = 1;
-                snprintf(c->stt_user, sizeof(c->stt_user), "%s", it.user_id);
+                /* Write all active speaker user IDs into stt_user until maximum capacity if multiple */
+                pthread_mutex_lock(&c->mtx);
+                rebuild_stt_user(c);
+                if(c->stt_user[0]) snprintf(c->stt_user_last, sizeof(c->stt_user_last), "%s", c->stt_user);
+                pthread_mutex_unlock(&c->mtx);
                 /* Clear partial accumulator on WS side for new speaker */
                 if(c->ws) {
                     pthread_mutex_lock(&c->ws->qmtx);
@@ -184,6 +216,11 @@ static void *consumer_thread(void *arg) {
                     c->active_len--;
                     break;
                 }
+                /* Update stt_user with remaining active speakers */
+                pthread_mutex_lock(&c->mtx);
+                rebuild_stt_user(c);
+                if(c->stt_user[0]) snprintf(c->stt_user_last, sizeof(c->stt_user_last), "%s", c->stt_user);
+                pthread_mutex_unlock(&c->mtx);
                 /* User stopped talking - keep streaming, server VAD handles turn detection */
             }
         } else if(it.type == ITEM_MIX) {
@@ -211,7 +248,7 @@ abmod_consumer *abmod_consumer_create(uint32_t sampling_rate, int channels) {
     const char *ws_url = getenv("ABMOD_OPENAI_WS_URL");
     const char *prompt = getenv("ABMOD_OPENAI_PROMPT");
     str_assign(&c->cfg_api_key, api_key);
-    str_assign(&c->cfg_model, model ? model : "gpt-4o-mini-transcribe");
+    str_assign(&c->cfg_model, model ? model : "gpt-4o-transcribe");
     /* Use transcription-specific endpoint by default */
     str_assign(&c->cfg_ws_url, ws_url ? ws_url : "wss://api.openai.com/v1/realtime?intent=transcription");
     str_assign(&c->cfg_prompt, prompt);
@@ -455,7 +492,7 @@ void abmod_consumer_publish_error(abmod_consumer *c, const char *json_payload) {
  *    URL: wss://api.openai.com/v1/realtime?intent=transcription
  *    - Simplified transcription-only endpoint
  *    - Audio format: pcm16 (24 kHz mono PCM, resampled from input rate)
- *    - Model: gpt-4o-mini-transcribe (default)
+ *    - Model: gpt-4o-transcribe (default)
  *    - Event type: transcription_session.update
  *    - Transcription events: transcription.delta, transcription.completed
  *    - No audio output from OpenAI
@@ -495,9 +532,10 @@ static void ws_enqueue(ws_client *ws, const char *json_text) {
 static void ws_send_session_update(ws_client *ws, const char *instructions) {
     if(!ws) return;
     const abmod_consumer *c = ws->owner;
-    const char *model = c && c->cfg_model ? c->cfg_model : "gpt-4o-mini-transcribe";
+    const char *model = c && c->cfg_model ? c->cfg_model : "gpt-4o-transcribe";
     const char *prompt = c ? c->cfg_prompt : NULL;
-    const char *lang = getenv("ABMOD_OPENAI_LANG");
+    const char *langEnv = getenv("ABMOD_OPENAI_LANG");
+    const char *lang = langEnv ? langEnv : "en"; // Default english only.
     const char *noise_reduction = getenv("ABMOD_OPENAI_NOISE_REDUCTION"); /* "near_field" or "far_field" */
     char buf[4096];
     
@@ -539,9 +577,10 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
           "{\"type\":\"transcription_session.update\",\"session\":{"
           "\"input_audio_format\":\"pcm16\","
           "\"input_audio_transcription\":%s,"
-          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":300}%s"
+          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":%d}%s"
           "}}",
           transcription_json,
+          SILENCE_THRESHOLD,
           noise_json
         );
         /* Session configuration sent */
@@ -562,12 +601,13 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
           "\"input_audio_format\":\"pcm16\","
           "\"output_audio_format\":\"pcm16\","
           "\"input_audio_transcription\":{\"model\":\"%s\"%s%s},"
-          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":300},"
+          "\"turn_detection\":{\"type\":\"server_vad\",\"threshold\":0.5,\"prefix_padding_ms\":300,\"silence_duration_ms\":%d},"
           "\"instructions\":\"You are a transcription assistant. Transcribe the audio accurately.\""
           "}}",
           model,
           (prompt && *prompt) ? ",\"prompt\":" : "",
-          (prompt && *prompt) ? prompt_json : ""
+          (prompt && *prompt) ? prompt_json : "",
+          SILENCE_THRESHOLD
         );
         /* Session configuration sent */
     }
@@ -578,6 +618,7 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
 
 static void ws_send_audio_append(ws_client *ws, const void *pcm16, size_t samples) {
     if(!ws || !pcm16 || samples == 0) return;
+    /* No utter tracking; just send audio */
     size_t bytes = samples * sizeof(int16_t);
     char *b64 = (char*)g_base64_encode((const guchar*)pcm16, bytes);
     if(!b64) return;
@@ -604,6 +645,14 @@ static void ws_process_incoming(ws_client *ws, const char *msg, size_t len) {
     if(!root) { fprintf(stderr, "[abmod] JSON parse error at %d: %s\n", (int)jerr.position, jerr.text); return; }
     const char *type = json_string_value(json_object_get(root, "type"));
     
+    /* Resolve current talking attribution (simple): stt_user, else stt_user_last, else unknown */
+    char stt_user_copy[128];
+    pthread_mutex_lock(&ws->owner->mtx);
+    if(ws->owner->stt_user[0]) snprintf(stt_user_copy, sizeof(stt_user_copy), "%s", ws->owner->stt_user);
+    else if(ws->owner->stt_user_last[0]) snprintf(stt_user_copy, sizeof(stt_user_copy), "%s", ws->owner->stt_user_last);
+    else snprintf(stt_user_copy, sizeof(stt_user_copy), "unknown");
+    pthread_mutex_unlock(&ws->owner->mtx);
+    
     if(type && strcmp(type, "response.delta")==0) {
         const char *delta = json_string_value(json_object_get(root, "delta"));
         if(delta && delta[0]) {
@@ -615,51 +664,59 @@ static void ws_process_incoming(ws_client *ws, const char *msg, size_t len) {
             ws->partial_len += strlen(delta);
             pthread_mutex_unlock(&ws->qmtx);
             /* publish partial */
-            consumer_publish_partial(ws->owner, ws->owner->stt_user, ws->partial);
+            consumer_publish_partial(ws->owner, stt_user_copy, ws->partial);
         }
     } else if((type && strcmp(type, "response.completed")==0) || (type && strcmp(type, "transcription.completed")==0)) {
         /* Final transcription from either mode */
         pthread_mutex_lock(&ws->qmtx);
         const char *final_text = ws->partial_len > 0 ? ws->partial : NULL;
         if(final_text && final_text[0]) {
-            fprintf(stderr, "[abmod] FINAL: '%s'\n", final_text);
-            consumer_publish_final(ws->owner, ws->owner->stt_user, final_text);
+            fprintf(stderr, "[abmod] FINAL [user=%s]: '%s'\n", stt_user_copy, final_text);
+            consumer_publish_final(ws->owner, stt_user_copy, final_text);
         }
         ws->partial_len = 0;
         pthread_mutex_unlock(&ws->qmtx);
+        /* Reset transcription active flag after completion */
+        pthread_mutex_lock(&ws->owner->mtx);
+        ws->owner->stt_active = 0;
+        pthread_mutex_unlock(&ws->owner->mtx);
     } else if(type && strcmp(type, "transcription.delta")==0) {
         /* Transcription intent mode event */
         const char *delta = json_string_value(json_object_get(root, "delta"));
         if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA: '%s'\n", delta);
+            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
             pthread_mutex_lock(&ws->qmtx);
             size_t need = ws->partial_len + strlen(delta) + 1;
             if(need > ws->partial_cap) { ws->partial_cap = need*2; ws->partial = (char*)realloc(ws->partial, ws->partial_cap); }
             memcpy(ws->partial + ws->partial_len, delta, strlen(delta)+1);
             ws->partial_len += strlen(delta);
             pthread_mutex_unlock(&ws->qmtx);
-            consumer_publish_partial(ws->owner, ws->owner->stt_user, ws->partial);
+            consumer_publish_partial(ws->owner, stt_user_copy, ws->partial);
         }
     } else if(type && strcmp(type, "response.audio_transcript.delta")==0) {
         const char *delta = json_string_value(json_object_get(root, "delta"));
         if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA: '%s'\n", delta);
-            consumer_publish_partial(ws->owner, ws->owner->stt_user, delta);
+            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
+            consumer_publish_partial(ws->owner, stt_user_copy, delta);
         }
     } else if(type && strcmp(type, "response.audio_transcript.done")==0) {
-        consumer_publish_final(ws->owner, ws->owner->stt_user, "");
+        consumer_publish_final(ws->owner, stt_user_copy, "");
     } else if(type && strcmp(type, "conversation.item.input_audio_transcription.delta")==0) {
         const char *delta = json_string_value(json_object_get(root, "delta"));
         if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA: '%s'\n", delta);
-            consumer_publish_partial(ws->owner, ws->owner->stt_user, delta);
+            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
+            consumer_publish_partial(ws->owner, stt_user_copy, delta);
         }
     } else if(type && strcmp(type, "conversation.item.input_audio_transcription.completed")==0) {
         const char *txt = json_string_value(json_object_get(root, "transcript"));
         if(txt && txt[0]) {
-            fprintf(stderr, "[abmod] FINAL: '%s'\n", txt);
-            consumer_publish_final(ws->owner, ws->owner->stt_user, txt);
+            fprintf(stderr, "[abmod] FINAL [user=%s]: '%s'\n", stt_user_copy, txt);
+            consumer_publish_final(ws->owner, stt_user_copy, txt);
         }
+        /* Reset transcription active flag after completion */
+        pthread_mutex_lock(&ws->owner->mtx);
+        ws->owner->stt_active = 0;
+        pthread_mutex_unlock(&ws->owner->mtx);
     } else if(type && strcmp(type, "input_audio_buffer.committed")==0) {
         /* Silent - audio committed */
     } else if(type && strcmp(type, "session.created")==0) {
@@ -905,10 +962,14 @@ static void *ws_thread(void *arg) {
 
 static void consumer_publish_partial(struct abmod_consumer *c, const char *user, const char *text) {
     if(!c || !user || !text) return;
-    char *payload = NULL;
-    size_t cap = strlen(user) + strlen(text) + 64;
-    payload = (char*)malloc(cap);
     char *json_text = json_dumps(json_string(text), JSON_ENCODE_ANY);
+    if(!json_text) return;
+    size_t cap = strlen(user) + strlen(json_text) + 32;
+    char *payload = malloc(cap);
+    if(!payload) {
+        free(json_text);
+        return;
+    }
     snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_text);
     free(json_text);
     abmod_consumer_publish_partial(c, payload);
@@ -917,10 +978,14 @@ static void consumer_publish_partial(struct abmod_consumer *c, const char *user,
 
 static void consumer_publish_final(struct abmod_consumer *c, const char *user, const char *text) {
     if(!c || !user || !text) return;
-    char *payload = NULL;
-    size_t cap = strlen(user) + strlen(text) + 64;
-    payload = (char*)malloc(cap);
     char *json_text = json_dumps(json_string(text), JSON_ENCODE_ANY);
+    if(!json_text) return;
+    size_t cap = strlen(user) + strlen(json_text) + 32;
+    char *payload = malloc(cap);
+    if(!payload) {
+        free(json_text);
+        return;
+    }
     snprintf(payload, cap, "{\"user\":\"%s\",\"text\":%s}", user, json_text);
     free(json_text);
     abmod_consumer_publish_final(c, payload);
