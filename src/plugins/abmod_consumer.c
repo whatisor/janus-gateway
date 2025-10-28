@@ -682,31 +682,34 @@ static void ws_process_incoming(ws_client *ws, const char *msg, size_t len) {
         pthread_mutex_unlock(&ws->owner->mtx);
     } else if(type && strcmp(type, "transcription.delta")==0) {
         /* Transcription intent mode event */
-        const char *delta = json_string_value(json_object_get(root, "delta"));
-        if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
-            pthread_mutex_lock(&ws->qmtx);
-            size_t need = ws->partial_len + strlen(delta) + 1;
-            if(need > ws->partial_cap) { ws->partial_cap = need*2; ws->partial = (char*)realloc(ws->partial, ws->partial_cap); }
-            memcpy(ws->partial + ws->partial_len, delta, strlen(delta)+1);
-            ws->partial_len += strlen(delta);
-            pthread_mutex_unlock(&ws->qmtx);
-            consumer_publish_partial(ws->owner, stt_user_copy, ws->partial);
-        }
-    } else if(type && strcmp(type, "response.audio_transcript.delta")==0) {
-        const char *delta = json_string_value(json_object_get(root, "delta"));
-        if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
-            consumer_publish_partial(ws->owner, stt_user_copy, delta);
-        }
+        // OpenAI intent mode does not send delta in realtime.
+        // const char *delta = json_string_value(json_object_get(root, "delta"));
+        // if(delta && delta[0]) {
+        //     fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
+        //     pthread_mutex_lock(&ws->qmtx);
+        //     size_t need = ws->partial_len + strlen(delta) + 1;
+        //     if(need > ws->partial_cap) { ws->partial_cap = need*2; ws->partial = (char*)realloc(ws->partial, ws->partial_cap); }
+        //     memcpy(ws->partial + ws->partial_len, delta, strlen(delta)+1);
+        //     ws->partial_len += strlen(delta);
+        //     pthread_mutex_unlock(&ws->qmtx);
+        //     consumer_publish_partial(ws->owner, stt_user_copy, ws->partial);
+        // }
+    } else if(type && strcmp(type, "response.audio_transcript.delta")==0) {        
+        // OpenAI intent mode does not send delta in realtime.
+        // const char *delta = json_string_value(json_object_get(root, "delta"));
+        // if(delta && delta[0]) {
+        //     fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
+        //     consumer_publish_partial(ws->owner, stt_user_copy, delta);
+        // }
     } else if(type && strcmp(type, "response.audio_transcript.done")==0) {
         consumer_publish_final(ws->owner, stt_user_copy, "");
-    } else if(type && strcmp(type, "conversation.item.input_audio_transcription.delta")==0) {
-        const char *delta = json_string_value(json_object_get(root, "delta"));
-        if(delta && delta[0]) {
-            fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
-            consumer_publish_partial(ws->owner, stt_user_copy, delta);
-        }
+    } else if(type && strcmp(type, "conversation.item.input_audio_transcription.delta")==0) {      
+        // OpenAI intent mode does not send delta in realtime.
+        // const char *delta = json_string_value(json_object_get(root, "delta"));
+        // if(delta && delta[0]) {
+        //     fprintf(stderr, "[abmod] DELTA [user=%s]: '%s'\n", stt_user_copy, delta);
+        //     consumer_publish_partial(ws->owner, stt_user_copy, delta);
+        // }
     } else if(type && strcmp(type, "conversation.item.input_audio_transcription.completed")==0) {
         const char *txt = json_string_value(json_object_get(root, "transcript"));
         if(txt && txt[0]) {
