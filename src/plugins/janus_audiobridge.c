@@ -6504,6 +6504,22 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 			JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 		}
 		json_decref(event);
+		/* Also notify custom module */
+		if(audiobridge->abmod_ctx && audiobridge->abmod_on_event) {
+			char *user_id_str = string_ids ? participant->user_id_str : NULL;
+			char user_id_buf[32];
+			if(!user_id_str) {
+				g_snprintf(user_id_buf, sizeof(user_id_buf), "%"SCNu64, participant->user_id);
+				user_id_str = user_id_buf;
+			}
+			audiobridge->talk_version++;
+			audiobridge->abmod_on_event(audiobridge->abmod_ctx,
+				"left",
+				audiobridge->room_id_str,
+				user_id_str,
+				janus_get_monotonic_time(),
+				audiobridge->talk_version);
+		}
 		/* Also notify event handlers */
 		if(notify_events && gateway->events_is_enabled()) {
 			json_t *info = json_object();
@@ -7970,6 +7986,22 @@ static void *janus_audiobridge_handler(void *data) {
 				JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 			}
 			json_decref(event);
+			/* Also notify custom module for the old room */
+			if(old_audiobridge->abmod_ctx && old_audiobridge->abmod_on_event) {
+				char *user_id_str = string_ids ? participant->user_id_str : NULL;
+				char user_id_buf[32];
+				if(!user_id_str) {
+					g_snprintf(user_id_buf, sizeof(user_id_buf), "%"SCNu64, participant->user_id);
+					user_id_str = user_id_buf;
+				}
+				old_audiobridge->talk_version++;
+				old_audiobridge->abmod_on_event(old_audiobridge->abmod_ctx,
+					"left",
+					old_audiobridge->room_id_str,
+					user_id_str,
+					janus_get_monotonic_time(),
+					old_audiobridge->talk_version);
+			}
 			/* Also notify event handlers */
 			if(notify_events && gateway->events_is_enabled()) {
 				json_t *info = json_object();
@@ -8180,6 +8212,22 @@ static void *janus_audiobridge_handler(void *data) {
 			janus_audiobridge_recorder_close(participant);
 			participant->mjr_active = FALSE;
 			janus_mutex_unlock(&participant->rec_mutex);
+			/* Also notify custom module */
+			if(audiobridge->abmod_ctx && audiobridge->abmod_on_event) {
+				char *user_id_str = string_ids ? participant->user_id_str : NULL;
+				char user_id_buf[32];
+				if(!user_id_str) {
+					g_snprintf(user_id_buf, sizeof(user_id_buf), "%"SCNu64, participant->user_id);
+					user_id_str = user_id_buf;
+				}
+				audiobridge->talk_version++;
+				audiobridge->abmod_on_event(audiobridge->abmod_ctx,
+					"left",
+					audiobridge->room_id_str,
+					user_id_str,
+					janus_get_monotonic_time(),
+					audiobridge->talk_version);
+			}
 			/* Also notify event handlers */
 			if(notify_events && gateway->events_is_enabled()) {
 				json_t *info = json_object();
