@@ -533,7 +533,7 @@ static void ws_send_session_update(ws_client *ws, const char *instructions) {
     if(!ws) return;
     const abmod_consumer *c = ws->owner;
     const char *model = c && c->cfg_model ? c->cfg_model : "gpt-4o-transcribe";
-    const char *prompt = c ? c->cfg_prompt : NULL;
+    const char *prompt = c && c->cfg_prompt && *c->cfg_prompt ? c->cfg_prompt : "Keep accurate, concise sentences. Remove filler words. No hallucination. Use [inaudible] if unclear.";
     const char *langEnv = getenv("ABMOD_OPENAI_LANG");
     const char *lang = langEnv ? langEnv : "en"; // Default english only.
     const char *noise_reduction = getenv("ABMOD_OPENAI_NOISE_REDUCTION"); /* "near_field" or "far_field" */
