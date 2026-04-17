@@ -25,18 +25,5 @@ typedef struct abmod_provider_vtbl {
 			const char *user_id);
 } abmod_provider_vtbl;
 
-/* Provider implementations expose init() returning impl + vtable */
-int abmod_provider_aws_init(const char *config_json,
-		const abmod_provider_callbacks *cbs,
-		void *cb_user,
-		void **out_impl,
-		const abmod_provider_vtbl **out_vtbl);
-
-int abmod_provider_openai_init(const char *config_json,
-		const abmod_provider_callbacks *cbs,
-		void *cb_user,
-		void **out_impl,
-		const abmod_provider_vtbl **out_vtbl);
-
 #endif /* ABMOD_PROVIDER_IMPL_H */
 

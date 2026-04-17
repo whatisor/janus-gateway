@@ -272,7 +272,10 @@ static void *abmod_worker(void *arg) {
 		pthread_mutex_unlock(&ctx->lock);
 
 		if(item.type == ABMOD_ITEM_EVENT) {
-			if(strcmp(item.event_name, "stopped-talking") == 0)
+			if(strcmp(item.event_name, "talking") == 0 || strcmp(item.event_name, "unmuted") == 0)
+				abmod_ensure_stream_locked(ctx, item.room_id, item.user_id,
+					ctx->rate, ctx->channels);
+			else if(strcmp(item.event_name, "muted") == 0 || strcmp(item.event_name, "left") == 0)
 				abmod_close_stream_locked(ctx, item.room_id, item.user_id);
 		} else if(item.type == ABMOD_ITEM_PCM_USER || item.type == ABMOD_ITEM_PCM_MIX) {
 			if(abmod_ensure_stream_locked(ctx, item.room_id, item.user_id, item.sampling_rate, item.channels) == 0)
@@ -437,7 +440,8 @@ void abmod_on_event(void *vctx, const char *event_name,
 	pthread_mutex_unlock(&ctx->lock);
 
 	ABMOD_LOG("event '%s' room=%s user=%s", event_name, room_id, user_id);
-	if(strcmp(event_name, "stopped-talking") == 0) {
+	if(strcmp(event_name, "talking") == 0 || strcmp(event_name, "unmuted") == 0 ||
+			strcmp(event_name, "muted") == 0 || strcmp(event_name, "left") == 0) {
 		abmod_qitem item;
 		memset(&item, 0, sizeof(item));
 		item.type = ABMOD_ITEM_EVENT;

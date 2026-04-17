@@ -84,6 +84,22 @@
 				</div>
 			</div>
 			<div class="container mt-4 hide" id="room">
+				<div class="row mb-2">
+					<div class="col-md-12">
+						<div class="d-flex align-items-center gap-2 flex-wrap">
+							<select class="form-select form-select-sm" id="sttProvider" style="width:auto">
+								<option value="aws">AWS Medical Transcribe</option>
+								<option value="openai">OpenAI Realtime</option>
+							</select>
+							<div id="openaiConfig" class="d-none d-flex align-items-center gap-2">
+								<select class="form-select form-select-sm" id="openaiModel" style="width:auto">
+									<option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+									<option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+								</select>
+							</div>
+						</div>
+					</div>
+				</div>
 				<div class="row mb-3">
 					<div class="col-md-12">
 						<div class="btn-group">

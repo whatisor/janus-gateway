@@ -89,15 +89,21 @@ function sttAppendError(who, msg) {
 // ─── ABMod config ────────────────────────────────────────────────────────────
 
 function buildAbmodConfig() {
+	var provider = $('#sttProvider').val() || 'aws';
+	if(provider === 'openai') {
+		return {
+			provider: 'openai',
+			openai_model: $('#openaiModel').val() || 'gpt-4o-transcribe',
+			openai_language: 'en'
+		};
+	}
 	return {
 		provider: 'aws',
-		aws_ws_url: 'wss://transcribestreaming.us-east-1.amazonaws.com:8443/medical-stream-transcription-websocket',
 		aws_language_code: 'en-US',
 		aws_region: 'us-east-1',
 		aws_specialty: 'PRIMARYCARE',
 		aws_stream_type: 'CONVERSATION',
 		aws_session_id_prefix: 'ab-',
-		aws_sigv4_expires: 300,
 		aws_medical_redaction: false
 	};
 }
@@ -358,6 +364,11 @@ $(document).ready(function() {
 		if(muted) { audiobridgeHandle.unmuteAudio(); $(this).text('Mute').removeClass('btn-success').addClass('btn-danger'); }
 		else       { audiobridgeHandle.muteAudio();   $(this).text('Unmute').removeClass('btn-danger').addClass('btn-success'); }
 		audiobridgeHandle.send({ message: { request: 'configure', muted: !muted } });
+	});
+
+	// Show/hide provider-specific config fields
+	$('#sttProvider').on('change', function() {
+		$('#openaiConfig').toggleClass('d-none', $(this).val() !== 'openai');
 	});
 
 	// Load ABMod

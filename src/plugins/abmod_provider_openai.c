@@ -61,6 +61,7 @@ struct openai_stream_s {
 	pthread_mutex_t qmtx;
 	openai_msg *qhead;
 	openai_msg *qtail;
+	int qlen; /* message count; used to cap pre-connect buffering */
 	/* URL parts */
 	char host[128];
 	int port;
@@ -107,9 +108,28 @@ static void openai_stream_enqueue(openai_stream *s, const char *json_text) {
 	pthread_mutex_lock(&s->qmtx);
 	if(s->qtail) s->qtail->next = m; else s->qhead = m;
 	s->qtail = m;
+	s->qlen++;
 	pthread_mutex_unlock(&s->qmtx);
-	if(s->lws_ctx && s->wsi)
-		lws_callback_on_writable(s->wsi);
+	if(s->lws_ctx)
+		lws_cancel_service(s->lws_ctx);
+}
+
+/* Prepend to queue front — used for session update on connect so it goes
+ * before any audio that was buffered during the connection handshake. */
+static void openai_stream_prepend(openai_stream *s, const char *json_text) {
+	if(!s || !json_text)
+		return;
+	openai_msg *m = (openai_msg *)calloc(1, sizeof(*m));
+	if(!m)
+		return;
+	m->data = strdup(json_text);
+	if(!m->data) { free(m); return; }
+	pthread_mutex_lock(&s->qmtx);
+	m->next = s->qhead;
+	s->qhead = m;
+	if(!s->qtail) s->qtail = m;
+	s->qlen++;
+	pthread_mutex_unlock(&s->qmtx);
 }
 
 static void openai_stream_send_session_update(openai_stream *s) {
@@ -157,8 +177,11 @@ static void openai_stream_send_session_update(openai_stream *s) {
 		transcription_json,
 		noise_json
 	);
-	openai_stream_enqueue(s, buf);
+	openai_stream_prepend(s, buf);
 }
+
+/* Alias used at connect time — name makes call-site intent clear */
+#define openai_stream_prepend_session_update openai_stream_send_session_update
 
 static void openai_stream_send_audio_append(openai_stream *s, const void *pcm16, size_t samples) {
 	if(!s || !pcm16 || samples == 0)
@@ -237,7 +260,8 @@ static int openai_lws_callback(struct lws *wsi, enum lws_callback_reasons reason
 		case LWS_CALLBACK_CLIENT_ESTABLISHED:
 			s->wsi = wsi;
 			s->connected = 1;
-			openai_stream_send_session_update(s);
+			/* Prepend session update so it drains before any buffered pre-connect audio */
+			openai_stream_prepend_session_update(s);
 			lws_callback_on_writable(wsi);
 			break;
 		case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
@@ -285,6 +309,7 @@ static int openai_lws_callback(struct lws *wsi, enum lws_callback_reasons reason
 			if(m) {
 				s->qhead = m->next;
 				if(!s->qhead) s->qtail = NULL;
+				s->qlen--;
 			}
 			pthread_mutex_unlock(&s->qmtx);
 			if(m) {
@@ -388,6 +413,12 @@ static void *openai_stream_thread(void *arg) {
 		}
 		lws_service(s->lws_ctx, 10);
 	}
+	/* Force-close any open connection so lws_context_destroy returns quickly
+	 * rather than waiting for a graceful TLS teardown from the peer. */
+	if(s->wsi) {
+		lws_set_timeout(s->wsi, PENDING_TIMEOUT_KILLED_BY_PROXY_CLIENT_CLOSE, LWS_TO_KILL_ASYNC);
+		lws_service(s->lws_ctx, 0);
+	}
 	if(s->lws_ctx) {
 		lws_context_destroy(s->lws_ctx);
 		s->lws_ctx = NULL;
@@ -435,6 +466,10 @@ static void openai_stream_destroy(openai_stream *s) {
 	if(!s)
 		return;
 	s->running = 0;
+	/* Wake the service thread immediately so it doesn't sleep up to 10ms
+	 * before noticing running==0. */
+	if(s->lws_ctx)
+		lws_cancel_service(s->lws_ctx);
 	if(s->th)
 		pthread_join(s->th, NULL);
 	pthread_mutex_lock(&s->qmtx);
@@ -525,8 +560,17 @@ static int openai_provider_send_pcm(void *vimpl,
 	openai_stream *s = (openai_stream *)g_hash_table_lookup(p->streams, key);
 	pthread_mutex_unlock(&p->mtx);
 	g_free(key);
-	if(!s || !s->connected || !s->resampler)
+	if(!s || !s->resampler)
 		return -1;
+	/* While connecting, cap buffered audio at 150 frames (~3000ms at 20ms/frame).
+	 * The burst drains in <10ms once connected so no accumulated latency builds up.
+	 * Beyond the cap, drop new audio to bound memory use if connection never comes. */
+	if(!s->connected) {
+		pthread_mutex_lock(&s->qmtx);
+		int full = (s->qlen >= 150);
+		pthread_mutex_unlock(&s->qmtx);
+		if(full) return 0;
+	}
 
 	/* Downmix to mono */
 	size_t in_mono = channels == 2 ? (samples / 2) : samples;

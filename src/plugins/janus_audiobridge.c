@@ -4393,6 +4393,14 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 			janus_audiobridge_participant_clear_inbuf(participant);
 		}
 		janus_mutex_unlock(&participant->qmutex);
+		/* Notify abmod — audiobridge->mutex is already held here */
+		if(audiobridge->abmod_ctx && audiobridge->abmod_on_event) {
+			audiobridge->talk_version++;
+			audiobridge->abmod_on_event(audiobridge->abmod_ctx,
+				participant->muted ? "muted" : "unmuted",
+				audiobridge->room_id_str, participant->user_id_str,
+				janus_get_monotonic_time(), audiobridge->talk_version);
+		}
 
 		json_t *list = json_array();
 		json_t *pl = json_object();
@@ -7342,16 +7350,19 @@ static void *janus_audiobridge_handler(void *data) {
 			if(abmod_unload && json_is_true(abmod_unload)) {
 				janus_mutex_lock(&rooms_mutex);
 				janus_audiobridge_room *audiobridge = participant->room;
+				void *abmod_ctx_to_destroy = NULL;
+				janus_abmod_destroy_f abmod_destroy_fn = NULL;
+				void *abmod_lib_to_close = NULL;
 				if(audiobridge) {
 					janus_mutex_lock(&audiobridge->mutex);
-					if(audiobridge->abmod_ctx && audiobridge->abmod_destroy) {
-						audiobridge->abmod_destroy(audiobridge->abmod_ctx);
-						audiobridge->abmod_ctx = NULL;
-					}
-					if(audiobridge->abmod_lib) {
-						dlclose(audiobridge->abmod_lib);
-						audiobridge->abmod_lib = NULL;
-					}
+					/* Snapshot and clear all abmod pointers under the lock so the
+					 * mixer stops calling them immediately, then destroy outside the
+					 * lock so we don't stall the mixer thread while joining threads. */
+					abmod_ctx_to_destroy = audiobridge->abmod_ctx;
+					abmod_destroy_fn = audiobridge->abmod_destroy;
+					abmod_lib_to_close = audiobridge->abmod_lib;
+					audiobridge->abmod_ctx = NULL;
+					audiobridge->abmod_lib = NULL;
 					g_clear_pointer(&audiobridge->abmod_path, g_free);
 					g_clear_pointer(&audiobridge->abmod_config, g_free);
 					audiobridge->abmod_create = NULL;
@@ -7362,6 +7373,11 @@ static void *janus_audiobridge_handler(void *data) {
 					janus_mutex_unlock(&audiobridge->mutex);
 				}
 				janus_mutex_unlock(&rooms_mutex);
+				/* Destroy outside all locks — this may block joining I/O threads */
+				if(abmod_ctx_to_destroy && abmod_destroy_fn)
+					abmod_destroy_fn(abmod_ctx_to_destroy);
+				if(abmod_lib_to_close)
+					dlclose(abmod_lib_to_close);
 			}
 			if(abmod_load && json_is_string(abmod_load)) {
 				const char *path = json_string_value(abmod_load);
@@ -7539,9 +7555,12 @@ static void *janus_audiobridge_handler(void *data) {
 			}
 			if(muted || display || (participant->stereo && spatial) || denoise) {
 				if(muted) {
+					int mute_changed = 0, new_muted = 0;
 					janus_mutex_lock(&participant->qmutex);
 					if(participant->muted != json_is_true(muted)) {
 						participant->muted = json_is_true(muted);
+						new_muted = participant->muted;
+						mute_changed = 1;
 						JANUS_LOG(LOG_VERB, "Setting muted property: %s (room %s, user %s)\n",
 							participant->muted ? "true" : "false", participant->room->room_id_str, participant->user_id_str);
 						/* Clear the queued packets waiting to be handled */
@@ -7549,6 +7568,16 @@ static void *janus_audiobridge_handler(void *data) {
 						janus_audiobridge_participant_clear_inbuf(participant);
 					}
 					janus_mutex_unlock(&participant->qmutex);
+					if(mute_changed && participant->room &&
+							participant->room->abmod_ctx && participant->room->abmod_on_event) {
+						janus_mutex_lock(&participant->room->mutex);
+						participant->room->talk_version++;
+						participant->room->abmod_on_event(participant->room->abmod_ctx,
+							new_muted ? "muted" : "unmuted",
+							participant->room->room_id_str, participant->user_id_str,
+							janus_get_monotonic_time(), participant->room->talk_version);
+						janus_mutex_unlock(&participant->room->mutex);
+					}
 				}
 				if(display) {
 					char *old_display = participant->display;

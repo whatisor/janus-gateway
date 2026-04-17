@@ -10,25 +10,39 @@ struct abmod_provider {
 	const abmod_provider_vtbl *vtbl;
 };
 
-static const char *abmod_default_provider(const char *provider_name) {
-	return (provider_name && *provider_name) ? provider_name : "aws";
-}
+/* ------------------------------------------------------------------ *
+ * Provider registry — add a forward declaration and a table entry to
+ * register a new provider; no other files need to change.
+ * ------------------------------------------------------------------ */
+typedef int (*abmod_provider_init_fn)(const char *config_json,
+		const abmod_provider_callbacks *cbs,
+		void *cb_user,
+		void **out_impl,
+		const abmod_provider_vtbl **out_vtbl);
+
+int abmod_provider_aws_init(const char *, const abmod_provider_callbacks *, void *, void **, const abmod_provider_vtbl **);
+int abmod_provider_openai_init(const char *, const abmod_provider_callbacks *, void *, void **, const abmod_provider_vtbl **);
+
+static const struct { const char *name; abmod_provider_init_fn init; } PROVIDERS[] = {
+	{ "aws",    abmod_provider_aws_init    },
+	{ "openai", abmod_provider_openai_init },
+};
+static const size_t PROVIDERS_COUNT = sizeof(PROVIDERS) / sizeof(PROVIDERS[0]);
 
 abmod_provider *abmod_provider_create(const char *provider_name,
 		const char *config_json,
 		const abmod_provider_callbacks *cbs,
 		void *user) {
-	const char *pname = abmod_default_provider(provider_name);
+	const char *pname = (provider_name && *provider_name) ? provider_name : "aws";
 	void *impl = NULL;
 	const abmod_provider_vtbl *vtbl = NULL;
 	int ok = 0;
 
-	if(strcmp(pname, "aws") == 0) {
-		ok = (abmod_provider_aws_init(config_json, cbs, user, &impl, &vtbl) == 0);
-	} else if(strcmp(pname, "openai") == 0) {
-		ok = (abmod_provider_openai_init(config_json, cbs, user, &impl, &vtbl) == 0);
-	} else {
-		ok = 0;
+	for(size_t i = 0; i < PROVIDERS_COUNT; i++) {
+		if(strcmp(pname, PROVIDERS[i].name) == 0) {
+			ok = (PROVIDERS[i].init(config_json, cbs, user, &impl, &vtbl) == 0);
+			break;
+		}
 	}
 	if(!ok || !impl || !vtbl)
 		return NULL;
