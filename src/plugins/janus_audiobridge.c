@@ -1591,6 +1591,7 @@ typedef struct janus_audiobridge_room {
     janus_abmod_destroy_f abmod_destroy;
     janus_abmod_on_mix_f abmod_on_mix;
     janus_abmod_on_event_f abmod_on_event;
+    janus_abmod_on_participant_pcm_f abmod_on_participant_pcm;
     /* Sequencing for module correlation */
     uint64_t frame_seq;         /* increments every mixed frame */
     uint64_t talk_version;      /* increments on each talk state change */
@@ -7357,6 +7358,7 @@ static void *janus_audiobridge_handler(void *data) {
 					audiobridge->abmod_destroy = NULL;
 					audiobridge->abmod_on_mix = NULL;
 					audiobridge->abmod_on_event = NULL;
+					audiobridge->abmod_on_participant_pcm = NULL;
 					janus_mutex_unlock(&audiobridge->mutex);
 				}
 				janus_mutex_unlock(&rooms_mutex);
@@ -7393,6 +7395,7 @@ static void *janus_audiobridge_handler(void *data) {
 						audiobridge->abmod_destroy = (janus_abmod_destroy_f)dlsym(lib, JANUS_ABMOD_DESTROY_SYMBOL);
 						audiobridge->abmod_on_mix = (janus_abmod_on_mix_f)dlsym(lib, JANUS_ABMOD_ON_MIX_SYMBOL);
 						audiobridge->abmod_on_event = (janus_abmod_on_event_f)dlsym(lib, JANUS_ABMOD_ON_EVENT_SYMBOL);
+						audiobridge->abmod_on_participant_pcm = (janus_abmod_on_participant_pcm_f)dlsym(lib, JANUS_ABMOD_ON_PARTICIPANT_PCM_SYMBOL);
 						if(!audiobridge->abmod_create || !audiobridge->abmod_destroy || !audiobridge->abmod_on_mix) {
 							JANUS_LOG(LOG_ERR, "[AudioBridge] abmod missing required symbols\n");
 							dlclose(lib);
@@ -7401,6 +7404,7 @@ static void *janus_audiobridge_handler(void *data) {
 							audiobridge->abmod_destroy = NULL;
 							audiobridge->abmod_on_mix = NULL;
 							audiobridge->abmod_on_event = NULL;
+							audiobridge->abmod_on_participant_pcm = NULL;
 						} else {
 							/* create instance using room parameters */
 							int channels = audiobridge->spatial_audio ? 2 : 1;
@@ -7417,6 +7421,7 @@ static void *janus_audiobridge_handler(void *data) {
 								audiobridge->abmod_destroy = NULL;
 								audiobridge->abmod_on_mix = NULL;
 								audiobridge->abmod_on_event = NULL;
+								audiobridge->abmod_on_participant_pcm = NULL;
 							} else {
 								audiobridge->abmod_lib = lib;
 								audiobridge->abmod_ctx = ctx;
@@ -9377,6 +9382,18 @@ static void *janus_audiobridge_participant_thread(void *data) {
 							janus_audiobridge_participant_clear_inbuf(participant);
 						}
 						participant->inbuf = g_list_append(participant->inbuf, pkt);
+						if(participant->room->abmod_ctx && participant->room->abmod_on_participant_pcm && pkt->length > 0) {
+							participant->room->abmod_on_participant_pcm(participant->room->abmod_ctx,
+								participant->room->room_id_str,
+								participant->user_id_str,
+								(const int16_t *)pkt->data,
+								(size_t)pkt->length,
+								participant->room->sampling_rate,
+								1,
+								pkt->timestamp,
+								participant->room->frame_seq,
+								participant->room->talk_version);
+						}
 						janus_mutex_unlock(&participant->qmutex);
 					} else {
 						/* No packet in the jitter buffer? Move on the talking detection, if needed */
@@ -9471,6 +9488,18 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						janus_audiobridge_participant_clear_inbuf(participant);
 					}
 					participant->inbuf = g_list_append(participant->inbuf, pkt);
+					if(participant->room->abmod_ctx && participant->room->abmod_on_participant_pcm && pkt->length > 0) {
+						participant->room->abmod_on_participant_pcm(participant->room->abmod_ctx,
+							participant->room->room_id_str,
+							participant->user_id_str,
+							(const int16_t *)pkt->data,
+							(size_t)pkt->length,
+							participant->room->sampling_rate,
+							1,
+							pkt->timestamp,
+							participant->room->frame_seq,
+							participant->room->talk_version);
+					}
 					janus_mutex_unlock(&participant->qmutex);
 				}
 			}

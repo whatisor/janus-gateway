@@ -982,6 +982,36 @@ AM_CONDITIONAL([WITH_SOURCE_DATE_EPOCH], [test "x$SOURCE_DATE_EPOCH" != "x"])
 AM_CONDITIONAL([ENABLE_POST_PROCESSING], [test "x$enable_post_processing" = "xyes"])
 AM_CONDITIONAL([ENABLE_PCAP2MJR], [test "x$enable_pcap2mjr" = "xyes"])
 
+AC_ARG_ENABLE([abmod-aws-sdk],
+              [AS_HELP_STRING([--enable-abmod-aws-sdk],
+                              [Link AWS SDK for C++ for per-user abmod AWS Transcribe (libaws-cpp-sdk-transcribestreaming)])],
+              [],
+              [enable_abmod_aws_sdk=no])
+
+AC_SUBST([ABMOD_AWS_SDK_CPPFLAGS], [""])
+AC_SUBST([ABMOD_AWS_SDK_LDFLAGS], [""])
+AC_SUBST([ABMOD_AWS_SDK_LIBS], [""])
+
+AS_IF([test "x$enable_abmod_aws_sdk" = "xyes"],
+      [
+       AC_PROG_CXX
+       AC_ARG_WITH([aws-sdk-cpp],
+                   [AS_HELP_STRING([--with-aws-sdk-cpp=DIR],
+                                   [Install prefix for AWS SDK for C++ (include/ and lib/). Default: /usr/local when --enable-abmod-aws-sdk is used.])],
+                   [AWS_SDK_CPP_PREFIX=$withval],
+                   [AWS_SDK_CPP_PREFIX=])
+       dnl Treat --without-aws-sdk-cpp like an unspecified prefix (use default below).
+       AS_IF([test "x$AWS_SDK_CPP_PREFIX" = "xno"], [AWS_SDK_CPP_PREFIX=])
+       dnl Without a prefix, ABMOD_AWS_SDK_CPPFLAGS stays empty and the C++ compile cannot find
+       dnl <aws/transcribestreaming/...> (typical when Docker enables abmod but omits --with-aws-sdk-cpp).
+       AS_IF([test -z "$AWS_SDK_CPP_PREFIX"], [AWS_SDK_CPP_PREFIX=/usr/local])
+       ABMOD_AWS_SDK_CPPFLAGS="-I$AWS_SDK_CPP_PREFIX/include"
+       ABMOD_AWS_SDK_LDFLAGS="-L$AWS_SDK_CPP_PREFIX/lib"
+       ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-core"
+      ])
+
+AM_CONDITIONAL([ENABLE_ABMOD_AWS_SDK], [test "x$enable_abmod_aws_sdk" = "xyes"])
+
 AC_CONFIG_FILES([
   Makefile
   src/Makefile
@@ -1064,6 +1094,9 @@ AM_COND_IF([ENABLE_PLUGIN_NOSIP],
 AM_COND_IF([ENABLE_PLUGIN_AUDIOBRIDGE],
 	[echo "    Audio Bridge:          yes"],
 	[echo "    Audio Bridge:          no"])
+AM_COND_IF([ENABLE_ABMOD_AWS_SDK],
+	[echo "    ABMod AWS SDK (C++):   yes (prefix: $[]AWS_SDK_CPP_PREFIX)"],
+	[echo "    ABMod AWS SDK (C++):   no (stub; use --enable-abmod-aws-sdk)"])
 AM_COND_IF([ENABLE_PLUGIN_VIDEOROOM],
 	[echo "    Video Room:            yes"],
 	[echo "    Video Room:            no"])

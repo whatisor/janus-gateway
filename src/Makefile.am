@@ -414,9 +414,12 @@ abmoduledir = $(libdir)/janus/abmodules
 abmodule_LTLIBRARIES = plugins/libabmod_transcriber_template.la
 plugins_libabmod_transcriber_template_la_SOURCES = \
     plugins/abmod_transcriber_template.c \
-    plugins/abmod_consumer.c \
+    plugins/abmod_provider.c \
+    plugins/abmod_provider_aws.c \
+    plugins/abmod_provider_openai.c \
     plugins/janus_ab_module.h \
-    plugins/abmod_consumer.h \
+    plugins/abmod_provider.h \
+    plugins/abmod_provider_impl.h \
     plugins/audiobridge-deps/resample.c \
     plugins/audiobridge-deps/arch.h \
     plugins/audiobridge-deps/os_support.h \
@@ -426,6 +429,19 @@ plugins_libabmod_transcriber_template_la_SOURCES = \
 plugins_libabmod_transcriber_template_la_CFLAGS = $(plugins_cflags) -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex -I$(top_srcdir)/src/plugins/audiobridge-deps/speex -I$(top_srcdir)/src/plugins/audiobridge-deps
 plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version $(WS_MANUAL_LIBS)
 plugins_libabmod_transcriber_template_la_LIBADD = $(plugins_libadd)
+
+if ENABLE_ABMOD_AWS_SDK
+plugins_libabmod_transcriber_template_la_SOURCES += \
+    plugins/abmod_provider_aws_sdk.cpp \
+    plugins/abmod_provider_aws_sdk.h
+plugins_libabmod_transcriber_template_la_CXXFLAGS = $(AM_CXXFLAGS) $(plugins_cflags) $(ABMOD_AWS_SDK_CPPFLAGS) -std=c++17
+plugins_libabmod_transcriber_template_la_LDFLAGS += $(ABMOD_AWS_SDK_LDFLAGS)
+plugins_libabmod_transcriber_template_la_LIBADD += $(ABMOD_AWS_SDK_LIBS) -lstdc++
+else
+plugins_libabmod_transcriber_template_la_SOURCES += \
+    plugins/abmod_provider_aws_stub.c \
+    plugins/abmod_provider_aws_sdk.h
+endif
 
 if ENABLE_PLUGIN_ECHOTEST
 plugin_LTLIBRARIES += plugins/libjanus_echotest.la

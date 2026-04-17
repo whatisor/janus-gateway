@@ -45,10 +45,11 @@ The module is dynamically managed per room: it can be loaded, reloaded, or unloa
   - Clean shutdown:
     - Room free path ensures `abmod_destroy` and `dlclose` are called and memory is freed.
 
-- Sample module `src/plugins/abmod_transcriber_template.c`
-  - Demonstrates the ABI with no-op processing.
-  - Tracks frames and optionally emits periodic heartbeats via `emit_event`.
-  - Serves as a template for integrating real transcription engines (local or remote).
+- Transcriber module `src/plugins/abmod_transcriber_template.c`
+  - Unified provider-based transcriber ABMod.
+  - Default path uses per-participant PCM via `abmod_on_participant_pcm` and offloads work to an internal queue/worker thread (non-blocking for AudioBridge hot paths).
+  - Optional mixed PCM streaming via `abmod_on_mix` when enabled in `abmod_config` (`enable_mix=true`).
+  - Providers are selected by `abmod_config.provider` (default `aws`, optional `openai`).
 
 ### Data Flow
 1) Participants send audio → AudioBridge per-participant buffers → Mixer combines into `buffer` → `outBuffer` (PCM16) prepared each frame.

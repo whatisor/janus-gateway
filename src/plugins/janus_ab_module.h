@@ -7,6 +7,7 @@
  *  - abmod_destroy(ctx)
  *  - abmod_on_mix(ctx, pcm, samples, rate, channels) is called for mixed PCM16 frames
  *  - abmod_on_event(ctx, name, room_id, user_id) is called for talk events
+ *  - abmod_on_participant_pcm(...) is optionally called for decoded per-user PCM16 frames
  */
 
 #ifndef JANUS_AB_MODULE_H
@@ -53,11 +54,24 @@ typedef void (*janus_abmod_on_event_f)(void *ctx,
         int64_t event_time_us,
         uint64_t talk_version);
 
+/* Optional: called on decoded per-participant PCM16 frames */
+typedef void (*janus_abmod_on_participant_pcm_f)(void *ctx,
+        const char *room_id,
+        const char *user_id,
+        const int16_t *pcm,
+        size_t samples,
+        uint32_t sampling_rate,
+        int channels,
+        uint32_t rtp_timestamp,
+        uint64_t frame_seq,
+        uint64_t active_talk_version);
+
 /* Symbol names that modules must export */
 #define JANUS_ABMOD_CREATE_SYMBOL "abmod_create"
 #define JANUS_ABMOD_DESTROY_SYMBOL "abmod_destroy"
 #define JANUS_ABMOD_ON_MIX_SYMBOL "abmod_on_mix"
 #define JANUS_ABMOD_ON_EVENT_SYMBOL "abmod_on_event"
+#define JANUS_ABMOD_ON_PARTICIPANT_PCM_SYMBOL "abmod_on_participant_pcm"
 
 #endif /* JANUS_AB_MODULE_H */
 

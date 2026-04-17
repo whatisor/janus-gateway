@@ -14,7 +14,7 @@
 <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-slider/10.6.2/bootstrap-slider.min.js"></script>
 <script type="text/javascript" src="settings.js" ></script>
 <script type="text/javascript" src="janus.js" ></script>
-<script type="module" src="audiobridge.js"></script>
+<script type="text/javascript" src="audiobridge.js"></script>
 <script>
 	$(function() {
 		$(".fixed-top").load("navbar.html", function() {
@@ -84,36 +84,41 @@
 				</div>
 			</div>
 			<div class="container mt-4 hide" id="room">
+				<div class="row mb-3">
+					<div class="col-md-12">
+						<div class="btn-group">
+							<button class="btn btn-danger hide" autocomplete="off" id="toggleaudio" disabled>Mute</button>
+							<button class="btn btn-warning" autocomplete="off" id="loadabmod" disabled>Load Transcription</button>
+							<button class="btn btn-outline-warning" autocomplete="off" id="unloadabmod" disabled>Unload Transcription</button>
+						</div>
+					</div>
+				</div>
 				<div class="row">
 					<div class="col-md-6">
 						<div class="card">
 							<div class="card-header">
-								<span class="card-title">Participants <span class="badge bg-info hide" id="participant"></span>
-								<div class="btn-group btn-group-sm top-right">
-									<button class="btn btn-danger hide" autocomplete="off" id="toggleaudio">Mute</button>
-									<button class="btn btn-primary hide" autocomplete="off" id="position">Position</button>
-									<button class="btn btn-secondary hide" autocomplete="off" id="togglesuspend">Suspend</button>
-								</div>
+								<span class="card-title">Participants
+									<span class="badge bg-info ms-1 hide" id="you"></span>
+								</span>
 							</div>
 							<div class="card-body">
-								<ul id="list" class="list-group">
-								</ul>
+								<ul id="list" class="list-group"></ul>
 							</div>
 						</div>
-					</div>
-					<div class="col-md-6">
-						<div class="card">
+						<div class="card mt-3">
 							<div class="card-header">
 								<span class="card-title">Mixed Audio</span>
 							</div>
 							<div class="card-body" id="mixedaudio"></div>
 						</div>
-						<div class="card mt-3">
+					</div>
+					<div class="col-md-6">
+						<div class="card">
 							<div class="card-header d-flex justify-content-between align-items-center">
 								<span class="card-title">Transcription</span>
-								<small class="text-muted" id="sttStatus">listening…</small>
+								<small class="text-muted" id="sttStatus">idle</small>
 							</div>
-							<div class="card-body" style="max-height: 320px; overflow-y: auto;">
+							<div class="card-body" style="max-height: 400px; overflow-y: auto;">
 								<ul id="sttConversation" class="list-group list-group-flush"></ul>
 							</div>
 						</div>
