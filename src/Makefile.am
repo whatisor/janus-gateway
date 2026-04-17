@@ -417,6 +417,7 @@ plugins_libabmod_transcriber_template_la_SOURCES = \
     plugins/abmod_provider.c \
     plugins/abmod_provider_aws.c \
     plugins/abmod_provider_openai.c \
+    plugins/abmod_embedding.h \
     plugins/janus_ab_module.h \
     plugins/abmod_provider.h \
     plugins/abmod_provider_impl.h \
@@ -426,22 +427,93 @@ plugins_libabmod_transcriber_template_la_SOURCES = \
     plugins/audiobridge-deps/speex/speex_resampler.h \
     plugins/audiobridge-deps/speex/speexdsp_types.h \
     plugins/audiobridge-deps/speex/speexdsp_config_types.h
-plugins_libabmod_transcriber_template_la_CFLAGS = $(plugins_cflags) -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex -I$(top_srcdir)/src/plugins/audiobridge-deps/speex -I$(top_srcdir)/src/plugins/audiobridge-deps
+
+# Default model directory baked in at compile time so the provider can
+# auto-load the embedding model without any runtime configuration.
+abmod_embedding_default_dir = $(datadir)/janus/models/all-MiniLM-L6-v2
+plugins_libabmod_transcriber_template_la_CFLAGS = \
+    $(plugins_cflags) \
+    -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps/speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps \
+    -DABMOD_EMBEDDING_DEFAULT_DIR=\"$(abmod_embedding_default_dir)\"
 plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version $(WS_MANUAL_LIBS)
 plugins_libabmod_transcriber_template_la_LIBADD = $(plugins_libadd)
+
+if ENABLE_ABMOD_EMBEDDING
+plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_embedding.cpp
+plugins_libabmod_transcriber_template_la_CXXFLAGS = \
+    $(AM_CXXFLAGS) $(plugins_cflags) \
+    $(ABMOD_ONNXRT_CPPFLAGS) \
+    -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps/speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps \
+    -DABMOD_EMBEDDING_DEFAULT_DIR=\"$(abmod_embedding_default_dir)\" \
+    -std=c++17
+plugins_libabmod_transcriber_template_la_LIBADD += $(ABMOD_ONNXRT_LIBS) -lstdc++
+else
+plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_embedding_stub.c
+endif
 
 if ENABLE_ABMOD_AWS_SDK
 plugins_libabmod_transcriber_template_la_SOURCES += \
     plugins/abmod_provider_aws_sdk.cpp \
     plugins/abmod_provider_aws_sdk.h
-plugins_libabmod_transcriber_template_la_CXXFLAGS = $(AM_CXXFLAGS) $(plugins_cflags) $(ABMOD_AWS_SDK_CPPFLAGS) -std=c++17
+if ENABLE_ABMOD_EMBEDDING
+plugins_libabmod_transcriber_template_la_CXXFLAGS += $(ABMOD_AWS_SDK_CPPFLAGS)
+else
+plugins_libabmod_transcriber_template_la_CXXFLAGS = \
+    $(AM_CXXFLAGS) $(plugins_cflags) $(ABMOD_AWS_SDK_CPPFLAGS) \
+    -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps/speex \
+    -I$(top_srcdir)/src/plugins/audiobridge-deps \
+    -std=c++17
+plugins_libabmod_transcriber_template_la_LIBADD += -lstdc++
+endif
 plugins_libabmod_transcriber_template_la_LDFLAGS += $(ABMOD_AWS_SDK_LDFLAGS)
-plugins_libabmod_transcriber_template_la_LIBADD += $(ABMOD_AWS_SDK_LIBS) -lstdc++
+plugins_libabmod_transcriber_template_la_LIBADD += $(ABMOD_AWS_SDK_LIBS)
 else
 plugins_libabmod_transcriber_template_la_SOURCES += \
     plugins/abmod_provider_aws_stub.c \
     plugins/abmod_provider_aws_sdk.h
 endif
+
+# ── Embedding model download ────────────────────────────────────────────────
+EMBEDDING_MODEL_DIR = $(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2
+HF_BASE = https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+
+download-models:
+	@echo "Downloading all-MiniLM-L6-v2 model files to $(EMBEDDING_MODEL_DIR) ..."
+	$(MKDIR_P) "$(EMBEDDING_MODEL_DIR)"
+	$(top_srcdir)/scripts/download_embedding_model.sh "$(EMBEDDING_MODEL_DIR)"
+	@echo "Done. Run 'make install' to put Janus files in the configured prefix."
+
+EMBEDDING_HF_BASE = https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+
+install-data-local:
+	$(MKDIR_P) "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2"
+	@if [ ! -f "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/model.onnx" ]; then \
+	    echo "  [embedding] Downloading model.onnx ..."; \
+	    wget -q --tries=3 \
+	        -O "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/model.onnx.tmp" \
+	        "$(EMBEDDING_HF_BASE)/onnx/model.onnx" && \
+	    mv "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/model.onnx.tmp" \
+	       "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/model.onnx" || \
+	    { rm -f "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/model.onnx.tmp"; \
+	      echo "  [embedding] WARNING: failed to download model.onnx — run 'make download-models' later"; }; \
+	fi
+	@if [ ! -f "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt" ]; then \
+	    echo "  [embedding] Downloading vocab.txt ..."; \
+	    wget -q --tries=3 \
+	        -O "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt.tmp" \
+	        "$(EMBEDDING_HF_BASE)/vocab.txt" && \
+	    mv "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt.tmp" \
+	       "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt" || \
+	    { rm -f "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt.tmp"; \
+	      echo "  [embedding] WARNING: failed to download vocab.txt — run 'make download-models' later"; }; \
+	fi
+
+.PHONY: download-models
 
 if ENABLE_PLUGIN_ECHOTEST
 plugin_LTLIBRARIES += plugins/libjanus_echotest.la

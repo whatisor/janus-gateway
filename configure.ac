@@ -1012,6 +1012,35 @@ AS_IF([test "x$enable_abmod_aws_sdk" = "xyes"],
 
 AM_CONDITIONAL([ENABLE_ABMOD_AWS_SDK], [test "x$enable_abmod_aws_sdk" = "xyes"])
 
+dnl ── ONNX Runtime for abmod embedding (all-MiniLM-L6-v2 selectBest) ──────────
+AC_SUBST([ABMOD_ONNXRT_CPPFLAGS], [""])
+AC_SUBST([ABMOD_ONNXRT_LIBS], [""])
+
+AC_ARG_WITH([onnxruntime],
+            [AS_HELP_STRING([--with-onnxruntime=DIR],
+                            [Install prefix for ONNX Runtime C++ (include/ and lib/). Default: /usr/local. Use --without-onnxruntime to disable embedding.])],
+            [ONNXRUNTIME_PREFIX=$withval],
+            [ONNXRUNTIME_PREFIX=/usr/local])
+
+AS_IF([test "x$ONNXRUNTIME_PREFIX" != "xno"],
+      [
+       AC_PROG_CXX
+       ABMOD_ONNXRT_CPPFLAGS="-I$ONNXRUNTIME_PREFIX/include"
+       ABMOD_ONNXRT_LIBS="-L$ONNXRUNTIME_PREFIX/lib -lonnxruntime"
+       enable_abmod_embedding=yes
+      ],
+      [enable_abmod_embedding=no])
+
+dnl Model directory — where 'make download-models' installs and the provider looks by default.
+AC_ARG_WITH([embedding-model-dir],
+            [AS_HELP_STRING([--with-embedding-model-dir=DIR],
+                            [Directory for all-MiniLM-L6-v2 ONNX model files. Default: DATADIR/janus/models/all-MiniLM-L6-v2])],
+            [ABMOD_EMBEDDING_MODEL_DIR=$withval],
+            [ABMOD_EMBEDDING_MODEL_DIR='$(datadir)/janus/models/all-MiniLM-L6-v2'])
+AC_SUBST([ABMOD_EMBEDDING_MODEL_DIR])
+
+AM_CONDITIONAL([ENABLE_ABMOD_EMBEDDING], [test "x$enable_abmod_embedding" = "xyes"])
+
 AC_CONFIG_FILES([
   Makefile
   src/Makefile
@@ -1097,6 +1126,9 @@ AM_COND_IF([ENABLE_PLUGIN_AUDIOBRIDGE],
 AM_COND_IF([ENABLE_ABMOD_AWS_SDK],
 	[echo "    ABMod AWS SDK (C++):   yes (prefix: $[]AWS_SDK_CPP_PREFIX)"],
 	[echo "    ABMod AWS SDK (C++):   no (stub; use --enable-abmod-aws-sdk)"])
+AM_COND_IF([ENABLE_ABMOD_EMBEDDING],
+	[echo "    ABMod Embedding (ORT): yes (prefix: $[]ONNXRUNTIME_PREFIX, models: $[]ABMOD_EMBEDDING_MODEL_DIR)"],
+	[echo "    ABMod Embedding (ORT): no  (use --with-onnxruntime to enable)"])
 AM_COND_IF([ENABLE_PLUGIN_VIDEOROOM],
 	[echo "    Video Room:            yes"],
 	[echo "    Video Room:            no"])

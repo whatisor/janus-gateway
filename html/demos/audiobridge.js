@@ -91,11 +91,15 @@ function sttAppendError(who, msg) {
 function buildAbmodConfig() {
 	var provider = $('#sttProvider').val() || 'aws';
 	if(provider === 'openai') {
-		return {
+		var cfg = {
 			provider: 'openai',
 			openai_model: $('#openaiModel').val() || 'gpt-4o-transcribe',
 			openai_language: 'en'
 		};
+		var concurrent = parseInt($('#openaiConcurrent').val(), 10);
+		if(concurrent > 1) cfg.openai_concurrent = concurrent;
+		if($('#openaiFastMode').is(':checked')) cfg.openai_fast_mode = true;
+		return cfg;
 	}
 	return {
 		provider: 'aws',
