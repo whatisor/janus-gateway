@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH}"
 
 # Build and install libnice (recommended newer version)
-RUN git clone https://gitlab.freedesktop.org/libnice/libnice /tmp/libnice \
+RUN git clone --branch 0.1.22 --depth 1  https://gitlab.freedesktop.org/libnice/libnice /tmp/libnice \
     && cd /tmp/libnice \
     && meson setup --prefix=/usr build \
     && ninja -C build \
@@ -34,6 +34,7 @@ RUN cd /tmp \
 # Build and install RNNoise (for HAVE_RNNOISE / post-processing)
 RUN git clone https://github.com/xiph/rnnoise.git /tmp/rnnoise \
     && cd /tmp/rnnoise \
+    && git checkout 70f1d256acd4b34a572f999a05c87bf00b67730d \
     && ./autogen.sh \
     && ./configure --prefix=/usr \
     && make -j"$(nproc)" \

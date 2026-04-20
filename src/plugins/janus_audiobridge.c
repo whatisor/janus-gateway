@@ -7343,6 +7343,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *gen_offer = json_object_get(root, "generate_offer");
 			json_t *update = json_object_get(root, "update");
 			json_t *rtp = json_object_get(root, "rtp");
+			/* TODO: Lockdown to admin only for abmod_load and abmod_unload */
 			json_t *abmod_load = json_object_get(root, "abmod_load");
 			json_t *abmod_unload = json_object_get(root, "abmod_unload");
 			json_t *abmod_config = json_object_get(root, "abmod_config");
@@ -9964,7 +9965,6 @@ static void janus_audiobridge_abmod_emit_event(void *user,
 	}
 
 	/* Broadcast to all participants in the room */
-	janus_mutex_lock(&audiobridge->mutex);
 	if(audiobridge->participants) {
 		GHashTableIter iter;
 		gpointer value;
@@ -9977,7 +9977,6 @@ static void janus_audiobridge_abmod_emit_event(void *user,
 			(void)ret;
 		}
 	}
-	janus_mutex_unlock(&audiobridge->mutex);
 	json_decref(pub);
 
 	/* Also notify event handlers for observability, if enabled */

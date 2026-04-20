@@ -315,10 +315,10 @@ void *abmod_aws_native_stream_open(const AbmodAwsNativeConfig *cfg,
 	s->cfg_sample_rate      = cfg->sample_rate;
 	s->cfg_medical_redaction= cfg->medical_redaction;
 	ABMOD_LOG("abmod_aws_native_stream_open region=%s language_code=%s specialty=%s stream_type=%s sample_rate=%d medical_redaction=%d",
-		cfg->region,
-		cfg->language_code,
-		cfg->specialty,
-		cfg->stream_type,
+		cfg->region ? cfg->region : "(null)",
+		cfg->language_code ? cfg->language_code : "(null)",
+		cfg->specialty ? cfg->specialty : "(null)",
+		cfg->stream_type ? cfg->stream_type : "(null)",
 		cfg->sample_rate, cfg->medical_redaction);
 	s->worker = std::thread([s]() {
 		try {
