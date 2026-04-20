@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F: 'NR>1{if\\(p+0>=7490 && p+0<=7560\\) print prev; p=$2; prev=$0} {p=$2; prev=$0}')",
+      "Bash(awk -F: '$2+0>=7300 && $2+0<=7560')",
+      "Bash(awk -F: '$2+0>=7300 && $2+0<=7360')",
+      "Bash(chmod +x e:/2025/janus-gateway/scripts/download_embedding_model.sh)"
+    ]
+  }
+}

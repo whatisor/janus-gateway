@@ -76,7 +76,6 @@ docker run --rm -it `
 docker build -t janus-dev --target dev .
 
 # Build with bind-mounts (source and output)
-# Build with bind-mounts (source and output)
 docker run --rm -it `
   -v ${PWD}:/work `
   -v ${PWD}/out:/out `

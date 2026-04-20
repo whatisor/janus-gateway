@@ -117,28 +117,28 @@ static void abmod_on_transcript(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
-		int is_final) {
+		int is_final,
+		const char *item_id) {
 	abmod_ctx *ctx = (abmod_ctx *)user;
 	if(!ctx)
 		return;
-	ABMOD_LOG("transcript [%s] room=%s user=%s %s: %s",
+	ABMOD_LOG("transcript [%s] room=%s user=%s item_id=%s %s: %s",
 		provider_name ? provider_name : "?",
 		room_id ? room_id : "?",
 		user_id ? user_id : "?",
+		item_id ? item_id : "?",
 		is_final ? "FINAL" : "partial",
 		text ? text : "(empty)");
 	json_t *payload = json_object();
 	json_object_set_new(payload, "provider", json_string(provider_name ? provider_name : "aws"));
 	json_object_set_new(payload, "room_id", json_string(room_id ? room_id : ""));
 	json_object_set_new(payload, "user_id", json_string(user_id ? user_id : ""));
-	json_object_set_new(payload, "user", json_string(user_id ? user_id : ""));
+	json_object_set_new(payload, "item_id", json_string(item_id ? item_id : ""));
 	json_object_set_new(payload, "language", json_string(ctx->language ? ctx->language : "en-US"));
 	json_object_set_new(payload, "text", json_string(text ? text : ""));
-	json_object_set_new(payload, "transcript", json_string(text ? text : ""));
-	json_object_set_new(payload, "item_id", json_string(user_id ? user_id : "unknown"));
 	json_object_set_new(payload, "type", json_string(is_final ? "final" : "partial"));
 	json_object_set_new(payload, "ts_us", json_integer((json_int_t)g_get_real_time()));
-	abmod_emit(ctx, is_final ? "transcription.final" : "transcription.partial", payload);
+	abmod_emit(ctx, "transcription", payload);
 	json_decref(payload);
 }
 
@@ -161,13 +161,11 @@ static void abmod_on_error(void *user,
 	json_object_set_new(payload, "provider", json_string(provider_name ? provider_name : "aws"));
 	json_object_set_new(payload, "room_id", json_string(room_id ? room_id : ""));
 	json_object_set_new(payload, "user_id", json_string(user_id ? user_id : ""));
-	json_object_set_new(payload, "user", json_string(user_id ? user_id : ""));
 	json_object_set_new(payload, "language", json_string(ctx->language ? ctx->language : "en-US"));
 	json_object_set_new(payload, "text", json_string(err));
-	json_object_set_new(payload, "message", json_string(err));
 	json_object_set_new(payload, "type", json_string(etype));
 	json_object_set_new(payload, "ts_us", json_integer((json_int_t)g_get_real_time()));
-	abmod_emit(ctx, "transcription.error", payload);
+	abmod_emit(ctx, "error", payload);
 	json_decref(payload);
 }
 

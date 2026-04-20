@@ -67,9 +67,8 @@ Module: `src/plugins/abmod_transcriber_template.c`
   - When enabled (`enable_mix=true`), per-user PCM streaming via `abmod_on_participant_pcm` is **disabled** — the two modes are mutually exclusive.
   - In mix mode, mixed PCM is streamed under `user_id="mixed"` and uses the most recently observed `room_id` (since the mix callback does not include room identity).
 - Emits Janus events:
-  - `transcription.partial`
-  - `transcription.final`
-  - `transcription.error`
+  - `transcription`
+  - `error`
 
 ### 4) Provider abstraction
 

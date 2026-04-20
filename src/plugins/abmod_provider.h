@@ -11,7 +11,8 @@ typedef void (*abmod_provider_transcript_cb)(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
-		int is_final);
+		int is_final,
+		const char *item_id);
 
 typedef void (*abmod_provider_error_cb)(void *user,
 		const char *provider_name,

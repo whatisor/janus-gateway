@@ -58,6 +58,7 @@ static int abmod_file_exists(const char *path) {
 
 typedef struct openai_provider_s   openai_provider;
 typedef struct openai_stream_s     openai_stream;
+typedef struct openai_user_session_s openai_user_session;
 
 /* ── Message queue ───────────────────────────────────────────────── */
 
@@ -71,6 +72,7 @@ typedef struct openai_msg_s {
 typedef struct openai_bucket_s {
 	char   *room_id;
 	char   *user_id;
+	char   *item_id;
 	char  **texts;
 	int     count;
 	int     target;
@@ -95,13 +97,17 @@ typedef struct {
 
 /* ── User session (one fast stream + N main streams per user) ────── */
 
-typedef struct {
+struct openai_user_session_s {
 	char          *room_id;
 	char          *user_id;
 	openai_stream *fast_stream;
 	openai_stream **main_streams;
 	int            concurrent;
-} openai_user_session;
+	/* Mirrors hook behavior: one shared item_id per active utterance */
+	char          *current_item_id;
+	uint64_t       next_item_seq;
+	pthread_mutex_t item_mtx;
+};
 
 /* ── Provider ─────────────────────────────────────────────────────── */
 
@@ -145,6 +151,7 @@ struct openai_stream_s {
 	char           *room_id;
 	char           *user_id;
 	openai_provider *p;
+	openai_user_session *session;
 	/* Per-stream config snapshot */
 	char  *prompt;
 	char  *lang;
@@ -206,6 +213,59 @@ static void openai_emit_error(openai_provider *p,
 			msg ? msg : "OpenAI error");
 }
 
+static char *openai_session_make_item_id(openai_user_session *sess) {
+	if(!sess) return g_strdup("");
+	int64_t now_ms = g_get_real_time() / 1000;
+	guint32 rnd = g_random_int();
+	return g_strdup_printf("%s_%s_%lld_%llu_%u",
+		sess->room_id ? sess->room_id : "",
+		sess->user_id ? sess->user_id : "",
+		(long long)now_ms,
+		(unsigned long long)(++sess->next_item_seq),
+		(unsigned int)rnd);
+}
+
+/* Keep one item_id pinned while a turn is in flight (same model as the TS hook). */
+static char *openai_session_ensure_item_id(openai_user_session *sess,
+		const char *preferred_item_id) {
+	if(!sess) return g_strdup(preferred_item_id ? preferred_item_id : "");
+	pthread_mutex_lock(&sess->item_mtx);
+	if(!sess->current_item_id || !*sess->current_item_id) {
+		if(preferred_item_id && *preferred_item_id)
+			sess->current_item_id = strdup(preferred_item_id);
+		else
+			sess->current_item_id = openai_session_make_item_id(sess);
+	}
+	char *item_id = strdup(sess->current_item_id ? sess->current_item_id : "");
+	pthread_mutex_unlock(&sess->item_mtx);
+	return item_id;
+}
+
+static void openai_session_clear_item_if_matches(openai_user_session *sess,
+		const char *item_id) {
+	if(!sess || !item_id || !*item_id) return;
+	pthread_mutex_lock(&sess->item_mtx);
+	if(sess->current_item_id && strcmp(sess->current_item_id, item_id) == 0) {
+		free(sess->current_item_id);
+		sess->current_item_id = NULL;
+	}
+	pthread_mutex_unlock(&sess->item_mtx);
+}
+
+static void openai_provider_clear_session_item_if_matches(openai_provider *p,
+		const char *room_id, const char *user_id, const char *item_id) {
+	if(!p || !item_id || !*item_id) return;
+	char *key = openai_build_key(room_id, user_id);
+	if(!key) return;
+	pthread_mutex_lock(&p->mtx);
+	openai_user_session *sess =
+		(openai_user_session *)g_hash_table_lookup(p->sessions, key);
+	pthread_mutex_unlock(&p->mtx);
+	g_free(key);
+	if(sess)
+		openai_session_clear_item_if_matches(sess, item_id);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Guard: collect concurrent main finals, resolve when all respond
  * ═══════════════════════════════════════════════════════════════════ */
@@ -246,18 +306,21 @@ static void openai_guard_resolve(openai_provider *p, openai_bucket *b) {
 emit:
 	if(p->cbs.on_transcript)
 		p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-			b->room_id, b->user_id, best, 1);
+			b->room_id, b->user_id, best, b->item_id, 1);
+	openai_provider_clear_session_item_if_matches(p,
+		b->room_id, b->user_id, b->item_id);
 	for(int i = 0; i < b->count; i++) free(b->texts[i]);
 	free(b->texts);
 	free(b->room_id);
 	free(b->user_id);
+	free(b->item_id);
 	free(b);
 }
 
 /* Called from stream LWS threads — must be lock-safe */
 static void openai_guard_add(openai_provider *p,
 		const char *room_id, const char *user_id,
-		const char *text, int concurrent) {
+		const char *item_id, const char *text, int concurrent) {
 	/* Mirror hook: double the window when concurrent >= 3 */
 	int64_t window_us = (concurrent >= 3) ? GUARD_WINDOW_US * 2 : GUARD_WINDOW_US;
 
@@ -265,7 +328,8 @@ static void openai_guard_add(openai_provider *p,
 	openai_bucket *b = p->guard_head;
 	while(b) {
 		if(strcmp(b->room_id, room_id) == 0 &&
-				strcmp(b->user_id, user_id) == 0)
+				strcmp(b->user_id, user_id) == 0 &&
+				strcmp(b->item_id, item_id ? item_id : "") == 0)
 			break;
 		b = b->next;
 	}
@@ -274,6 +338,7 @@ static void openai_guard_add(openai_provider *p,
 		if(!b) { pthread_mutex_unlock(&p->guard_mtx); return; }
 		b->room_id     = strdup(room_id ? room_id : "");
 		b->user_id     = strdup(user_id ? user_id : "");
+		b->item_id     = strdup(item_id ? item_id : "");
 		b->target      = concurrent;
 		b->deadline_us = g_get_real_time() + window_us;
 		b->prompt_len  = (p->prompt && *p->prompt) ? strlen(p->prompt) : 0;
@@ -300,7 +365,7 @@ static void openai_guard_cancel_user(openai_provider *p,
 			if(prev) prev->next = b->next; else p->guard_head = b->next;
 			pthread_mutex_unlock(&p->guard_mtx);
 			for(int i = 0; i < b->count; i++) free(b->texts[i]);
-			free(b->texts); free(b->room_id); free(b->user_id); free(b);
+			free(b->texts); free(b->room_id); free(b->user_id); free(b->item_id); free(b);
 			return;
 		}
 		prev = b; b = b->next;
@@ -354,15 +419,18 @@ static void *openai_guard_thread_fn(void *arg) {
  *                              finals go through the guard
  */
 static void openai_stream_on_transcript_internal(openai_stream *s,
-		const char *text, int is_final) {
+		const char *text, int is_final, const char *event_item_id) {
 	openai_provider *p = s->p;
 	if(!p) return;
+	char *item_id = openai_session_ensure_item_id(s->session, event_item_id);
+	if(!item_id) return;
 
 	if(s->is_fast) {
 		/* Mini stream: everything is a partial */
 		if(p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, 0);
+				s->room_id, s->user_id, text, item_id, 0);
+		free(item_id);
 		return;
 	}
 
@@ -370,7 +438,10 @@ static void openai_stream_on_transcript_internal(openai_stream *s,
 		/* Single main stream: pass through unchanged */
 		if(p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, is_final);
+				s->room_id, s->user_id, text, item_id, is_final);
+		if(is_final)
+			openai_session_clear_item_if_matches(s->session, item_id);
+		free(item_id);
 		return;
 	}
 
@@ -379,12 +450,28 @@ static void openai_stream_on_transcript_internal(openai_stream *s,
 		/* Partials from main streams: forward only when there is no mini stream */
 		if(!p->fast_mode && p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, 0);
+				s->room_id, s->user_id, text, item_id, 0);
+		free(item_id);
 		return;
 	}
 
 	/* Final from one of the concurrent main streams → guard */
-	openai_guard_add(p, s->room_id, s->user_id, text, p->concurrent);
+	openai_guard_add(p, s->room_id, s->user_id, item_id, text, p->concurrent);
+	free(item_id);
+}
+
+static const char *openai_extract_item_id(json_t *root) {
+	if(!root || !json_is_object(root)) return NULL;
+	const char *item_id = json_string_value(json_object_get(root, "item_id"));
+	if(item_id && *item_id) return item_id;
+	item_id = json_string_value(json_object_get(root, "conversation_item_id"));
+	if(item_id && *item_id) return item_id;
+	json_t *item = json_object_get(root, "item");
+	if(json_is_object(item)) {
+		item_id = json_string_value(json_object_get(item, "id"));
+		if(item_id && *item_id) return item_id;
+	}
+	return NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -564,6 +651,7 @@ static void openai_stream_process_incoming(openai_stream *s,
 		return;
 	}
 	const char *type = json_string_value(json_object_get(root, "type"));
+	const char *event_item_id = openai_extract_item_id(root);
 
 	if(type && (strcmp(type, "response.delta") == 0 ||
 			strcmp(type, "transcription.delta") == 0)) {
@@ -580,7 +668,7 @@ static void openai_stream_process_incoming(openai_stream *s,
 				s->partial_len += strlen(delta);
 			}
 			pthread_mutex_unlock(&s->qmtx);
-			openai_stream_on_transcript_internal(s, delta, 0);
+			openai_stream_on_transcript_internal(s, delta, 0, event_item_id);
 		}
 	} else if(type && (strcmp(type, "response.completed") == 0 ||
 			strcmp(type, "transcription.completed") == 0 ||
@@ -593,7 +681,7 @@ static void openai_stream_process_incoming(openai_stream *s,
 			pthread_mutex_unlock(&s->qmtx);
 		}
 		if(txt && *txt)
-			openai_stream_on_transcript_internal(s, txt, 1);
+			openai_stream_on_transcript_internal(s, txt, 1, event_item_id);
 		pthread_mutex_lock(&s->qmtx);
 		s->partial_len = 0;
 		pthread_mutex_unlock(&s->qmtx);
@@ -788,6 +876,7 @@ static void *openai_stream_thread(void *arg) {
 }
 
 static openai_stream *openai_stream_create(openai_provider *p,
+		openai_user_session *sess,
 		const char *room_id, const char *user_id,
 		uint32_t sample_rate, int channels,
 		const openai_stream_config *cfg) {
@@ -795,6 +884,7 @@ static openai_stream *openai_stream_create(openai_provider *p,
 	openai_stream *s = (openai_stream *)calloc(1, sizeof(*s));
 	if(!s) return NULL;
 	s->p       = p;
+	s->session = sess;
 	s->room_id = strdup(room_id ? room_id : "");
 	s->user_id = strdup(user_id ? user_id : "");
 	s->key     = openai_build_key(room_id, user_id);
@@ -868,6 +958,7 @@ static openai_user_session *openai_session_create(openai_provider *p,
 	sess->room_id   = strdup(room_id ? room_id : "");
 	sess->user_id   = strdup(user_id ? user_id : "");
 	sess->concurrent = p->concurrent > 0 ? p->concurrent : 1;
+	pthread_mutex_init(&sess->item_mtx, NULL);
 
 	if(p->fast_mode) {
 		openai_stream_config mini = {
@@ -881,7 +972,7 @@ static openai_user_session *openai_session_create(openai_provider *p,
 			.presentation_mode     = 0,
 			.is_fast               = 1,
 		};
-		sess->fast_stream = openai_stream_create(p, room_id, user_id,
+		sess->fast_stream = openai_stream_create(p, sess, room_id, user_id,
 			sample_rate, channels, &mini);
 	}
 
@@ -904,7 +995,7 @@ static openai_user_session *openai_session_create(openai_provider *p,
 			.presentation_mode     = p->presentation_mode,
 			.is_fast               = 0,
 		};
-		sess->main_streams[i] = openai_stream_create(p, room_id, user_id,
+		sess->main_streams[i] = openai_stream_create(p, sess, room_id, user_id,
 			sample_rate, channels, &main_cfg);
 	}
 	return sess;
@@ -915,6 +1006,10 @@ static void openai_session_destroy(openai_provider *p,
 	if(!sess) return;
 	/* Cancel any pending guard bucket before tearing down streams */
 	openai_guard_cancel_user(p, sess->room_id, sess->user_id);
+	pthread_mutex_lock(&sess->item_mtx);
+	free(sess->current_item_id);
+	sess->current_item_id = NULL;
+	pthread_mutex_unlock(&sess->item_mtx);
 	openai_stream_destroy(sess->fast_stream);
 	if(sess->main_streams) {
 		for(int i = 0; i < sess->concurrent; i++)
@@ -923,6 +1018,7 @@ static void openai_session_destroy(openai_provider *p,
 	}
 	free(sess->room_id);
 	free(sess->user_id);
+	pthread_mutex_destroy(&sess->item_mtx);
 	free(sess);
 }
 
@@ -956,7 +1052,7 @@ static void openai_provider_destroy(void *vimpl) {
 	while(b) {
 		openai_bucket *n = b->next;
 		for(int i = 0; i < b->count; i++) free(b->texts[i]);
-		free(b->texts); free(b->room_id); free(b->user_id); free(b);
+		free(b->texts); free(b->room_id); free(b->user_id); free(b->item_id); free(b);
 		b = n;
 	}
 	pthread_mutex_destroy(&p->guard_mtx);

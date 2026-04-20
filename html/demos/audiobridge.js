@@ -86,6 +86,27 @@ function sttAppendError(who, msg) {
 	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
 }
 
+function sttNormalizeAbmod(msg) {
+	var payload = msg && (msg.payload || msg.data) ? (msg.payload || msg.data) : {};
+	var sttEvent = (msg && (msg.event || msg.type)) || payload.event || '';
+	var payloadType = payload.type || '';
+	var userField = payload.user_id || payload.userId || payload.user || '';
+	var itemId = payload.item_id || payload.itemId || payload.id || null;
+	var text = payload.text || payload.message || '';
+	var provider = payload.provider || '';
+	var language = payload.language || payload.lang || '';
+	return {
+		event: sttEvent,
+		type: payloadType,
+		userField: userField,
+		itemId: itemId,
+		text: text,
+		provider: provider,
+		language: language,
+		payload: payload
+	};
+}
+
 // ─── ABMod config ────────────────────────────────────────────────────────────
 
 function buildAbmodConfig() {
@@ -108,7 +129,8 @@ function buildAbmodConfig() {
 		aws_specialty: 'PRIMARYCARE',
 		aws_stream_type: 'CONVERSATION',
 		aws_session_id_prefix: 'ab-',
-		aws_medical_redaction: false
+		aws_medical_redaction: true,
+		aws_fast_mode: $('#awsFastMode').is(':checked')
 	};
 }
 
@@ -219,23 +241,34 @@ function handleMessage(msg, jsep) {
 	}
 
 	// ABMod transcription events
+	// ABMod emits exactly two event types:
+	//   event='transcription'  payload.type='partial'|'final'  payload.item_id=<aws-result-uuid>
+	//   event='error'          payload.type='error'|'auth_error'
 	if(event === 'abmod') {
-		var sttType   = msg['event'];
-		var payload   = msg['payload'] || {};
-		var userField = payload.user || payload.user_id || '';
-		var itemId    = payload.item_id || null;
-		var text      = payload.text || payload.transcript || payload.message || '';
-		var payloadType = payload.type || '';
+		var stt = sttNormalizeAbmod(msg);
+		var sttType = stt.event;
+		var payload = stt.payload;
+		var userField = stt.userField;
+		var itemId = stt.itemId;
+		var text = stt.text;
+		var payloadType = stt.type;
 		var who = sttResolveMultiple(userField) || 'Unknown';
+		if(userField && who)
+			sttRememberUser(userField, who);
 
-		$('#sttStatus').text(sttType === 'transcription.final' ? 'final' : 'listening\u2026');
-
-		if(payloadType === 'partial' || sttType === 'transcription.partial') {
-			sttUpdatePartial(itemId, String(userField), who, text);
-		} else if(payloadType === 'final' || sttType === 'transcription.final') {
-			sttFinalize(itemId, String(userField), who, text);
-		} else if(sttType === 'transcription.error') {
-			sttAppendError('[' + (payload.type || 'error') + '] ' + who, text);
+		if(sttType === 'transcription' || sttType === 'transcript') {
+			$('#sttStatus').text(payloadType === 'final' ? 'final' : 'listening\u2026');
+			if(payloadType === 'partial') {
+				sttUpdatePartial(itemId, String(userField), who, text);
+			} else if(payloadType === 'final' || !payloadType) {
+				/* Treat missing type as finalized text for compatibility with older emitters. */
+				sttFinalize(itemId, String(userField), who, text);
+			}
+		} else if(sttType === 'error') {
+			$('#sttStatus').text('error');
+			var errTag = payloadType ? ('[' + payloadType + '] ') : '';
+			var whoTag = who ? who : (payload.provider || 'STT');
+			sttAppendError(errTag + whoTag, text || 'Unknown STT error');
 		}
 		return;
 	}
@@ -372,7 +405,9 @@ $(document).ready(function() {
 
 	// Show/hide provider-specific config fields
 	$('#sttProvider').on('change', function() {
-		$('#openaiConfig').toggleClass('d-none', $(this).val() !== 'openai');
+		var isOpenai = $(this).val() === 'openai';
+		$('#openaiConfig').toggleClass('d-none', !isOpenai);
+		$('#awsConfig').toggleClass('d-none', isOpenai);
 	});
 
 	// Load ABMod

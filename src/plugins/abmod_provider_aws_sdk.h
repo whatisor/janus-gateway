@@ -16,6 +16,7 @@ typedef struct AbmodAwsNativeConfig {
 	const char *session_id;
 	uint32_t sample_rate;
 	int medical_redaction;
+	int fast_mode; /* 1=emit partial+final, 0=emit final only */
 	const char *access_key_id;
 	const char *secret_access_key;
 	const char *session_token;
@@ -25,6 +26,7 @@ typedef void (*abmod_sdk_transcript_fn)(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		const char *item_id,
 		int is_final);
 
 typedef void (*abmod_sdk_error_fn)(void *user,

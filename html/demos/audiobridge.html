@@ -91,6 +91,12 @@
 								<option value="aws">AWS Medical Transcribe</option>
 								<option value="openai">OpenAI Realtime</option>
 							</select>
+							<div id="awsConfig" class="d-flex align-items-center gap-2 flex-wrap">
+								<div class="form-check mb-0" title="Emit partial + final transcripts when enabled; finals only when disabled">
+									<input class="form-check-input" type="checkbox" id="awsFastMode" checked>
+									<label class="form-check-label" for="awsFastMode">Fast mode</label>
+								</div>
+							</div>
 							<div id="openaiConfig" class="d-none d-flex align-items-center gap-2 flex-wrap">
 								<select class="form-select form-select-sm" id="openaiModel" style="width:auto" title="Model">
 									<option value="gpt-4o-transcribe">gpt-4o-transcribe</option>

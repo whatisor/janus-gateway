@@ -44,6 +44,7 @@ struct abmod_provider_aws {
 	char *aws_secret_access_key;
 	char *aws_session_token;
 	int medical_redaction;
+	int fast_mode;
 	GHashTable *streams;
 	pthread_mutex_t streams_mtx;
 	abmod_provider_callbacks cbs;
@@ -68,13 +69,14 @@ static void sdk_on_text(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		const char *item_id,
 		int is_final) {
-	ABMOD_LOG("sdk_on_text room=%s user=%s %s: %s",
+	ABMOD_LOG("sdk_on_text room=%s user=%s %s item_id=%s: %s",
 		room_id ? room_id : "?", user_id ? user_id : "?",
-		is_final ? "FINAL" : "partial", text ? text : "(empty)");
+		is_final ? "FINAL" : "partial", item_id ? item_id : "?", text ? text : "(empty)");
 	abmod_provider_aws *p = (abmod_provider_aws *)user;
 	if(p && p->cbs.on_transcript)
-		p->cbs.on_transcript(p->cb_user, ABMOD_AWS_PROVIDER_NAME, room_id, user_id, text, is_final);
+		p->cbs.on_transcript(p->cb_user, ABMOD_AWS_PROVIDER_NAME, room_id, user_id, text, is_final, item_id);
 }
 
 static void sdk_on_err(void *user,
@@ -155,6 +157,7 @@ static int abmod_provider_aws_open_user_stream(void *vimpl,
 	cfg.session_id = session_id;
 	cfg.sample_rate = sample_rate;
 	cfg.medical_redaction = provider->medical_redaction;
+	cfg.fast_mode = provider->fast_mode;
 	cfg.access_key_id = provider->aws_access_key_id;
 	cfg.secret_access_key = provider->aws_secret_access_key;
 	cfg.session_token = provider->aws_session_token;
@@ -261,6 +264,7 @@ int abmod_provider_aws_init(const char *config_json,
 	provider->aws_secret_access_key = g_strdup(getenv("AWS_SECRET_ACCESS_KEY"));
 	provider->aws_session_token = g_strdup(getenv("AWS_SESSION_TOKEN"));
 	provider->medical_redaction = 0;
+	provider->fast_mode = 1;
 
 	if(config_json) {
 		json_error_t err;
@@ -274,6 +278,9 @@ int abmod_provider_aws_init(const char *config_json,
 			const char *access_key_id = json_string_value(json_object_get(cfg, "aws_access_key_id"));
 			const char *secret_access_key = json_string_value(json_object_get(cfg, "aws_secret_access_key"));
 			const char *session_token = json_string_value(json_object_get(cfg, "aws_session_token"));
+			json_t *fast_mode_obj = json_object_get(cfg, "aws_fast_mode");
+			if(!fast_mode_obj)
+				fast_mode_obj = json_object_get(cfg, "fast_mode");
 			int redaction = json_boolean_value(json_object_get(cfg, "aws_medical_redaction"));
 			g_free(provider->language_code);
 			provider->language_code = abmod_strdup_or_default(lang, "en-US");
@@ -298,13 +305,17 @@ int abmod_provider_aws_init(const char *config_json,
 				provider->aws_session_token = g_strdup(session_token);
 			}
 			provider->medical_redaction = redaction ? 1 : 0;
+			if(json_is_boolean(fast_mode_obj))
+				provider->fast_mode = json_boolean_value(fast_mode_obj) ? 1 : 0;
 		}
 		if(cfg)
 			json_decref(cfg);
 	}
 
-	ABMOD_LOG("init OK region=%s lang=%s specialty=%s",
-		provider->region, provider->language_code, provider->specialty);
+	ABMOD_LOG("init OK region=%s lang=%s specialty=%s stream_type=%s redaction=%s fast_mode=%s",
+		provider->region, provider->language_code, provider->specialty, provider->stream_type,
+		provider->medical_redaction ? "redaction ON" : "redaction OFF",
+		provider->fast_mode ? "ON" : "OFF");
 	abmod_aws_native_global_init();
 	*out_impl = provider;
 	*out_vtbl = &ABMOD_AWS_VTBL;

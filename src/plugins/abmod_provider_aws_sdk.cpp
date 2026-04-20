@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,6 +55,27 @@ namespace {
 std::mutex g_sdk_mutex;
 std::atomic<int> g_sdk_refcount{0};
 SDKOptions g_sdk_options;
+
+static std::string regex_escape(const std::string &s) {
+	static const std::regex re(R"([.^$|()\[\]{}*+?\\])");
+	return std::regex_replace(s, re, R"(\$&)");
+}
+
+static std::string redact_text_with_entities(const std::string &text,
+		const Aws::Vector<MedicalEntity> &entities) {
+	if(text.empty() || entities.empty())
+		return text;
+	std::string redacted = text;
+	for(const auto &entity : entities) {
+		std::string content = entity.GetContent().c_str();
+		if(content.empty())
+			continue;
+		/* TS proxy behavior: replace whole-token occurrences, case-insensitive. */
+		std::regex token_re("\\b" + regex_escape(content) + "\\b", std::regex_constants::icase);
+		redacted = std::regex_replace(redacted, token_re, "[PHI]");
+	}
+	return redacted;
+}
 
 static LanguageCode parse_language(const char *lc) {
 	(void)lc;
@@ -102,6 +124,7 @@ struct NativeStream {
 	std::string cfg_session_token;
 	uint32_t cfg_sample_rate{16000};
 	int cfg_medical_redaction{0};
+	bool cfg_fast_mode{true};
 
 	std::shared_ptr<TranscribeStreamingServiceClient> client;
 	std::thread worker;
@@ -115,10 +138,10 @@ struct NativeStream {
 			on_err(cb_user, room_id, user_id, msg);
 	}
 
-	void emit_txt(const Aws::String &text, bool is_final) {
+	void emit_txt(const Aws::String &text, const Aws::String &result_id, bool is_final) {
 		if(!on_text || text.empty())
 			return;
-		on_text(cb_user, room_id, user_id, text.c_str(), is_final ? 1 : 0);
+		on_text(cb_user, room_id, user_id, text.c_str(), result_id.c_str(), is_final ? 1 : 0);
 	}
 
 	void close_internal() {
@@ -187,8 +210,15 @@ struct NativeStream {
 				Aws::String txt = alts[0].GetTranscript();
 				if(txt.empty())
 					continue;
+				if(cfg_medical_redaction) {
+					std::string raw = txt.c_str();
+					std::string masked = redact_text_with_entities(raw, alts[0].GetEntities());
+					txt = Aws::String(masked.c_str());
+				}
 				bool is_partial = r.GetIsPartial();
-				emit_txt(txt, !is_partial);
+				if(!cfg_fast_mode && is_partial)
+					continue;
+				emit_txt(txt, r.GetResultId(), !is_partial);
 			}
 		});
 
@@ -314,12 +344,13 @@ void *abmod_aws_native_stream_open(const AbmodAwsNativeConfig *cfg,
 	s->cfg_session_token    = cfg->session_token    ? cfg->session_token   : "";
 	s->cfg_sample_rate      = cfg->sample_rate;
 	s->cfg_medical_redaction= cfg->medical_redaction;
-	ABMOD_LOG("abmod_aws_native_stream_open region=%s language_code=%s specialty=%s stream_type=%s sample_rate=%d medical_redaction=%d",
+	s->cfg_fast_mode        = cfg->fast_mode ? true : false;
+	ABMOD_LOG("abmod_aws_native_stream_open region=%s language_code=%s specialty=%s stream_type=%s sample_rate=%d medical_redaction=%d fast_mode=%d",
 		cfg->region ? cfg->region : "(null)",
 		cfg->language_code ? cfg->language_code : "(null)",
 		cfg->specialty ? cfg->specialty : "(null)",
 		cfg->stream_type ? cfg->stream_type : "(null)",
-		cfg->sample_rate, cfg->medical_redaction);
+		cfg->sample_rate, cfg->medical_redaction, cfg->fast_mode);
 	s->worker = std::thread([s]() {
 		try {
 			s->run_async();
