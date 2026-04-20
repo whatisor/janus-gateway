@@ -104,6 +104,7 @@ struct NativeStream {
 	std::condition_variable cv;
 	std::queue<std::vector<uint8_t>> q;
 	bool stop{false};
+	bool closing{false};
 	bool stream_error{false}; /* set when WriteAudioEvent fails; stop accepting PCM */
 
 	void *cb_user{nullptr};
@@ -148,6 +149,7 @@ struct NativeStream {
 		{
 			std::lock_guard<std::mutex> lk(mu);
 			stop = true;
+			closing = true;
 		}
 		cv.notify_all();
 		if(worker.joinable())
@@ -240,18 +242,22 @@ struct NativeStream {
 		auto on_stream_ready = [this](AudioStream &stream) {
 			for(;;) {
 				std::vector<uint8_t> chunk;
+				bool is_closing = false;
 				{
 					std::unique_lock<std::mutex> lk(mu);
 					cv.wait(lk, [this] {
 						return stop || !q.empty();
 					});
+					is_closing = closing;
 					if(stop && q.empty()) {
 						/* Empty AudioEvent ends the stream per AWS bidirectional event spec */
 						if(!stream.WriteAudioEvent(AudioEvent())) {
-							emit_err("WriteAudioEvent(empty) failed");
+							if(!is_closing)
+								emit_err("WriteAudioEvent(empty) failed");
 							return;
 						}
 						stream.flush();
+						/* Explicit close avoids 15s AWS idle timeout on unload. */
 						stream.Close();
 						return;
 					}
@@ -289,8 +295,24 @@ struct NativeStream {
 				const StartMedicalStreamTranscriptionRequest &,
 				const StartMedicalStreamTranscriptionOutcome &outcome,
 				const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
-			if(!outcome.IsSuccess())
-				emit_err(outcome.GetError().GetMessage().c_str());
+			if(!outcome.IsSuccess()) {
+				const Aws::String msg = outcome.GetError().GetMessage();
+				bool is_closing = false;
+				{
+					std::lock_guard<std::mutex> lk(mu);
+					is_closing = closing;
+				}
+				if(is_closing) {
+					const std::string s = msg.c_str();
+					const bool benign_shutdown_error =
+						s.find("A complete signal was sent without the preceding empty frame") != std::string::npos ||
+						s.find("timed out because no new audio was received") != std::string::npos;
+					if(!benign_shutdown_error)
+						emit_err(msg.c_str());
+				} else {
+					emit_err(msg.c_str());
+				}
+			}
 			done.Release();
 		};
 

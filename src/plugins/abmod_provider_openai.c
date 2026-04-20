@@ -11,7 +11,7 @@
  *  presentation_mode – halves silence_duration_ms.
  *  prompt     – client-supplied verbatim; server never generates one.
  */
-
+// TODO: Not tested yet.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
