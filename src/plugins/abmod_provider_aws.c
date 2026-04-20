@@ -43,6 +43,7 @@ struct abmod_provider_aws {
 	char *aws_access_key_id;
 	char *aws_secret_access_key;
 	char *aws_session_token;
+	int medical_enabled;
 	int medical_redaction;
 	int fast_mode;
 	GHashTable *streams;
@@ -263,6 +264,7 @@ int abmod_provider_aws_init(const char *config_json,
 	provider->aws_access_key_id = g_strdup(getenv("AWS_ACCESS_KEY_ID"));
 	provider->aws_secret_access_key = g_strdup(getenv("AWS_SECRET_ACCESS_KEY"));
 	provider->aws_session_token = g_strdup(getenv("AWS_SESSION_TOKEN"));
+	provider->medical_enabled = 1;
 	provider->medical_redaction = 0;
 	provider->fast_mode = 1;
 
@@ -278,6 +280,9 @@ int abmod_provider_aws_init(const char *config_json,
 			const char *access_key_id = json_string_value(json_object_get(cfg, "aws_access_key_id"));
 			const char *secret_access_key = json_string_value(json_object_get(cfg, "aws_secret_access_key"));
 			const char *session_token = json_string_value(json_object_get(cfg, "aws_session_token"));
+			json_t *medical_enabled_obj = json_object_get(cfg, "aws_medical_enabled");
+			if(!medical_enabled_obj)
+				medical_enabled_obj = json_object_get(cfg, "medical");
 			json_t *fast_mode_obj = json_object_get(cfg, "aws_fast_mode");
 			if(!fast_mode_obj)
 				fast_mode_obj = json_object_get(cfg, "fast_mode");
@@ -304,16 +309,24 @@ int abmod_provider_aws_init(const char *config_json,
 				g_free(provider->aws_session_token);
 				provider->aws_session_token = g_strdup(session_token);
 			}
+			if(json_is_boolean(medical_enabled_obj))
+				provider->medical_enabled = json_boolean_value(medical_enabled_obj) ? 1 : 0;
 			provider->medical_redaction = redaction ? 1 : 0;
 			if(json_is_boolean(fast_mode_obj))
 				provider->fast_mode = json_boolean_value(fast_mode_obj) ? 1 : 0;
+			if(!provider->medical_enabled) {
+				provider->medical_redaction = 0;
+				g_free(provider->specialty);
+				provider->specialty = g_strdup("PRIMARYCARE");
+			}
 		}
 		if(cfg)
 			json_decref(cfg);
 	}
 
-	ABMOD_LOG("init OK region=%s lang=%s specialty=%s stream_type=%s redaction=%s fast_mode=%s",
+	ABMOD_LOG("init OK region=%s lang=%s specialty=%s stream_type=%s medical=%s redaction=%s fast_mode=%s",
 		provider->region, provider->language_code, provider->specialty, provider->stream_type,
+		provider->medical_enabled ? "ON" : "OFF",
 		provider->medical_redaction ? "redaction ON" : "redaction OFF",
 		provider->fast_mode ? "ON" : "OFF");
 	abmod_aws_native_global_init();
