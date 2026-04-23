@@ -84,29 +84,77 @@
 				</div>
 			</div>
 			<div class="container mt-4 hide" id="room">
+				<div class="row mb-2">
+					<div class="col-md-12">
+						<div class="d-flex align-items-center gap-2 flex-wrap">
+							<select class="form-select form-select-sm" id="sttProvider" style="width:auto">
+								<option value="aws">AWS Medical Transcribe</option>
+								<option value="openai">OpenAI Realtime</option>
+							</select>
+							<div id="awsConfig" class="d-flex align-items-center gap-2 flex-wrap">
+								<div class="form-check mb-0" title="Emit partial + final transcripts when enabled; finals only when disabled">
+									<input class="form-check-input" type="checkbox" id="awsFastMode" checked>
+									<label class="form-check-label" for="awsFastMode">Fast mode</label>
+								</div>
+								<div class="input-group input-group-sm" style="width:auto" title="Comma-separated medical terms to add as a custom vocabulary (e.g. Metformin, Lisinopril)">
+									<span class="input-group-text">Vocab prompt</span>
+									<input type="text" class="form-control" id="awsVocabPrompt" placeholder="e.g. Metformin, Lisinopril" style="width:220px">
+								</div>
+							</div>
+							<div id="openaiConfig" class="d-none d-flex align-items-center gap-2 flex-wrap">
+								<select class="form-select form-select-sm" id="openaiModel" style="width:auto" title="Model">
+									<option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+									<option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+								</select>
+								<div class="input-group input-group-sm" style="width:auto">
+									<span class="input-group-text" title="Parallel streams — finals emitted when all agree">Concurrent</span>
+									<input type="number" class="form-control" id="openaiConcurrent" value="1" min="1" max="5" style="width:55px">
+								</div>
+								<div class="form-check mb-0" title="Enable low-latency mini stream for faster partials">
+									<input class="form-check-input" type="checkbox" id="openaiFastMode">
+									<label class="form-check-label" for="openaiFastMode">Fast mode</label>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+				<div class="row mb-3">
+					<div class="col-md-12">
+						<div class="btn-group">
+							<button class="btn btn-danger hide" autocomplete="off" id="toggleaudio" disabled>Mute</button>
+							<button class="btn btn-warning" autocomplete="off" id="loadabmod" disabled>Load Transcription</button>
+							<button class="btn btn-outline-warning" autocomplete="off" id="unloadabmod" disabled>Unload Transcription</button>
+						</div>
+					</div>
+				</div>
 				<div class="row">
 					<div class="col-md-6">
 						<div class="card">
 							<div class="card-header">
-								<span class="card-title">Participants <span class="badge bg-info hide" id="participant"></span>
-								<div class="btn-group btn-group-sm top-right">
-									<button class="btn btn-danger hide" autocomplete="off" id="toggleaudio">Mute</button>
-									<button class="btn btn-primary hide" autocomplete="off" id="position">Position</button>
-									<button class="btn btn-secondary hide" autocomplete="off" id="togglesuspend">Suspend</button>
-								</div>
+								<span class="card-title">Participants
+									<span class="badge bg-info ms-1 hide" id="you"></span>
+								</span>
 							</div>
 							<div class="card-body">
-								<ul id="list" class="list-group">
-								</ul>
+								<ul id="list" class="list-group"></ul>
 							</div>
 						</div>
-					</div>
-					<div class="col-md-6">
-						<div class="card">
+						<div class="card mt-3">
 							<div class="card-header">
 								<span class="card-title">Mixed Audio</span>
 							</div>
 							<div class="card-body" id="mixedaudio"></div>
+						</div>
+					</div>
+					<div class="col-md-6">
+						<div class="card">
+							<div class="card-header d-flex justify-content-between align-items-center">
+								<span class="card-title">Transcription</span>
+								<small class="text-muted" id="sttStatus">idle</small>
+							</div>
+							<div class="card-body" style="max-height: 400px; overflow-y: auto;">
+								<ul id="sttConversation" class="list-group list-group-flush"></ul>
+							</div>
 						</div>
 					</div>
 				</div>

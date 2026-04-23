@@ -1,0 +1,578 @@
+/*
+ * AWS Transcribe Medical streaming using the official AWS SDK for C++.
+ * https://docs.aws.amazon.com/sdk-for-cpp/v1/developer-guide/cpp_transcribe-streaming_code_examples.html
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "../config.h"
+#endif
+#include "abmod_provider_aws_sdk.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <condition_variable>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#include <string.h>
+#define ABMOD_STRICMP _stricmp
+#else
+#include <strings.h>
+#define ABMOD_STRICMP strcasecmp
+#endif
+
+#define ABMOD_LOG(fmt, ...) \
+	fprintf(stderr, "[ABMod][aws] " fmt "\n", ##__VA_ARGS__)
+#include <aws/core/Aws.h>
+#include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/utils/threading/Semaphore.h>
+/* HAVE_AWS_TRANSCRIBE_SDK is written by configure (AC_CHECK_HEADER).
+ * Fall back to __has_include for out-of-autoconf builds. */
+#if defined(HAVE_AWS_TRANSCRIBE_SDK) || \
+    (!defined(HAVE_CONFIG_H) && __has_include(<aws/transcribe/TranscribeServiceClient.h>))
+#  define ABMOD_HAS_TRANSCRIBE_VOCAB 0 /*No support live creation for medical*/
+#  include <aws/transcribe/TranscribeServiceClient.h>
+#  include <aws/transcribe/model/CreateVocabularyRequest.h>
+#  include <aws/transcribe/model/DeleteVocabularyRequest.h>
+#  include <aws/transcribe/model/GetVocabularyRequest.h>
+#  include <aws/transcribe/model/VocabularyState.h>
+#else
+#  define ABMOD_HAS_TRANSCRIBE_VOCAB 0
+#endif
+#include <aws/transcribestreaming/TranscribeStreamingServiceClient.h>
+#include <aws/transcribestreaming/model/AudioEvent.h>
+#include <aws/transcribestreaming/model/AudioStream.h>
+#include <aws/transcribestreaming/model/MediaEncoding.h>
+#include <aws/transcribestreaming/model/MedicalAlternative.h>
+#include <aws/transcribestreaming/model/MedicalResult.h>
+#include <aws/transcribestreaming/model/MedicalTranscript.h>
+#include <aws/transcribestreaming/model/MedicalTranscriptEvent.h>
+#include <aws/transcribestreaming/model/StartMedicalStreamTranscriptionHandler.h>
+#include <aws/transcribestreaming/model/StartMedicalStreamTranscriptionRequest.h>
+#include <aws/transcribestreaming/model/Type.h>
+
+using namespace Aws;
+using namespace Aws::Client;
+using namespace Aws::Auth;
+using namespace Aws::TranscribeStreamingService;
+using namespace Aws::TranscribeStreamingService::Model;
+
+namespace {
+
+std::mutex g_sdk_mutex;
+std::atomic<int> g_sdk_refcount{0};
+SDKOptions g_sdk_options;
+
+static std::string regex_escape(const std::string &s) {
+	static const std::regex re(R"([.^$|()\[\]{}*+?\\])");
+	return std::regex_replace(s, re, R"(\$&)");
+}
+
+static std::string redact_text_with_entities(const std::string &text,
+		const Aws::Vector<MedicalEntity> &entities) {
+	if(text.empty() || entities.empty())
+		return text;
+	std::string redacted = text;
+	for(const auto &entity : entities) {
+		std::string content = entity.GetContent().c_str();
+		if(content.empty())
+			continue;
+		/* TS proxy behavior: replace whole-token occurrences, case-insensitive. */
+		std::regex token_re("\\b" + regex_escape(content) + "\\b", std::regex_constants::icase);
+		redacted = std::regex_replace(redacted, token_re, "[PHI]");
+	}
+	return redacted;
+}
+
+static LanguageCode parse_language(const char *lc) {
+	(void)lc;
+	/* Medical streaming US English; extend mapping if needed */
+	return LanguageCode::en_US;
+}
+
+static Specialty parse_specialty(const char *sp) {
+	(void)sp;
+	return Specialty::PRIMARYCARE;
+}
+
+static Type parse_type(const char *t) {
+	if(t && ABMOD_STRICMP(t, "DICTATION") == 0)
+		return Type::DICTATION;
+	return Type::CONVERSATION;
+}
+
+/* Max PCM chunks buffered before we start dropping (prevents unbounded growth
+ * when AWS is slow or the connection stalls). At 960 samples / 16 kHz =
+ * 60 ms/frame, 200 frames = ~12 s of audio. */
+static constexpr size_t NATIVE_QUEUE_MAX = 200;
+
+struct NativeStream {
+	std::mutex mu;
+	std::condition_variable cv;
+	std::queue<std::vector<uint8_t>> q;
+	bool stop{false};
+	bool closing{false};
+	bool stream_error{false}; /* set when WriteAudioEvent fails; stop accepting PCM */
+
+	void *cb_user{nullptr};
+	abmod_sdk_transcript_fn on_text{nullptr};
+	abmod_sdk_error_fn on_err{nullptr};
+	char room_id[256]{};
+	char user_id[256]{};
+
+	/* Deep copies of config strings — owned by this object so they are valid
+	 * on the worker thread even after the caller frees its temporaries. */
+	std::string cfg_region;
+	std::string cfg_language_code;
+	std::string cfg_specialty;
+	std::string cfg_stream_type;
+	std::string cfg_session_id;
+	std::string cfg_access_key_id;
+	std::string cfg_secret_access_key;
+	std::string cfg_session_token;
+	std::string cfg_vocabulary_name;
+	uint32_t cfg_sample_rate{16000};
+	int cfg_medical_redaction{0};
+	bool cfg_fast_mode{true};
+
+	std::shared_ptr<TranscribeStreamingServiceClient> client;
+	std::thread worker;
+
+	~NativeStream() {
+		close_internal();
+	}
+
+	void emit_err(const char *msg) {
+		if(on_err && msg)
+			on_err(cb_user, room_id, user_id, msg);
+	}
+
+	void emit_txt(const Aws::String &text, const Aws::String &result_id, bool is_final) {
+		if(!on_text || text.empty())
+			return;
+		on_text(cb_user, room_id, user_id, text.c_str(), result_id.c_str(), is_final ? 1 : 0);
+	}
+
+	void close_internal() {
+		{
+			std::lock_guard<std::mutex> lk(mu);
+			stop = true;
+			closing = true;
+		}
+		cv.notify_all();
+		if(worker.joinable())
+			worker.join();
+	}
+
+	void push_pcm(const int16_t *pcm, size_t samples, int channels) {
+		if(!pcm || samples == 0)
+			return;
+		std::vector<uint8_t> buf;
+		if(channels > 1) {
+			buf.resize(samples * sizeof(int16_t));
+			for(size_t i = 0; i < samples; i++) {
+				int16_t m = pcm[i * channels];
+				memcpy(buf.data() + i * sizeof(int16_t), &m, sizeof(int16_t));
+			}
+		} else {
+			buf.resize(samples * sizeof(int16_t));
+			memcpy(buf.data(), pcm, buf.size());
+		}
+		std::lock_guard<std::mutex> lk(mu);
+		if(stop || stream_error)
+			return;
+		if(q.size() >= NATIVE_QUEUE_MAX) {
+			/* Drop oldest frame to keep latency bounded */
+			q.pop();
+		}
+		q.push(std::move(buf));
+		cv.notify_one();
+	}
+
+	void run_async() {
+		ClientConfiguration client_cfg;
+		client_cfg.region = cfg_region;
+
+		/* SDK 1.11: pass credentials directly to the client constructor;
+		 * ClientConfiguration no longer has a credentialsProvider field. */
+		if(!cfg_access_key_id.empty() && !cfg_secret_access_key.empty()) {
+			if(!cfg_session_token.empty()) {
+				ABMOD_LOG("Using AWS credentials from config (session_token=%s)", cfg_session_token.c_str());
+				AWSCredentials creds(cfg_access_key_id, cfg_secret_access_key, cfg_session_token);
+				client = std::make_shared<TranscribeStreamingServiceClient>(creds, client_cfg);
+			} else {
+				AWSCredentials creds(cfg_access_key_id, cfg_secret_access_key);
+				client = std::make_shared<TranscribeStreamingServiceClient>(creds, client_cfg);
+			}
+		} else {
+			client = std::make_shared<TranscribeStreamingServiceClient>(client_cfg);
+		}
+
+		StartMedicalStreamTranscriptionHandler handler;
+		handler.SetOnErrorCallback([this](const Aws::Client::AWSError<TranscribeStreamingServiceErrors> &err) {
+			emit_err(err.GetMessage().c_str());
+		});
+		/* SDK 1.11: Medical streaming uses MedicalTranscriptEvent / MedicalResult /
+		 * MedicalAlternative — same logical structure, different type names. */
+		handler.SetMedicalTranscriptEventCallback([this](const MedicalTranscriptEvent &ev) {
+			const auto &tr = ev.GetTranscript();
+			const auto &results = tr.GetResults();
+			for(const auto &r : results) {
+				const auto &alts = r.GetAlternatives();
+				if(alts.empty())
+					continue;
+				Aws::String txt = alts[0].GetTranscript();
+				if(txt.empty())
+					continue;
+				if(cfg_medical_redaction) {
+					std::string raw = txt.c_str();
+					std::string masked = redact_text_with_entities(raw, alts[0].GetEntities());
+					txt = Aws::String(masked.c_str());
+				}
+				bool is_partial = r.GetIsPartial();
+				if(!cfg_fast_mode && is_partial)
+					continue;
+				emit_txt(txt, r.GetResultId(), !is_partial);
+			}
+		});
+
+		StartMedicalStreamTranscriptionRequest request;
+		request.SetLanguageCode(parse_language(cfg_language_code.c_str()));
+		request.SetMediaSampleRateHertz(static_cast<int>(cfg_sample_rate));
+		request.SetMediaEncoding(MediaEncoding::pcm);
+		request.SetSpecialty(parse_specialty(cfg_specialty.c_str()));
+		request.SetType(parse_type(cfg_stream_type.c_str()));
+		if(!cfg_session_id.empty())
+		 	request.SetSessionId(Aws::String(cfg_session_id));
+		if(cfg_medical_redaction)
+			request.SetContentIdentificationType(MedicalContentIdentificationType::PHI);
+
+		if(!cfg_vocabulary_name.empty())
+			request.SetVocabularyName(Aws::String(cfg_vocabulary_name));
+
+		request.SetEventStreamHandler(handler);
+
+		Utils::Threading::Semaphore done(0, 1);
+
+		auto on_stream_ready = [this](AudioStream &stream) {
+			for(;;) {
+				std::vector<uint8_t> chunk;
+				bool is_closing = false;
+				{
+					std::unique_lock<std::mutex> lk(mu);
+					cv.wait(lk, [this] {
+						return stop || !q.empty();
+					});
+					is_closing = closing;
+					if(stop && q.empty()) {
+						/* Empty AudioEvent ends the stream per AWS bidirectional event spec */
+						if(!stream.WriteAudioEvent(AudioEvent())) {
+							if(!is_closing)
+								emit_err("WriteAudioEvent(empty) failed");
+							return;
+						}
+						stream.flush();
+						/* Explicit close avoids 15s AWS idle timeout on unload. */
+						stream.Close();
+						return;
+					}
+					if(!q.empty()) {
+						chunk = std::move(q.front());
+						q.pop();
+					}
+				}
+			if(!chunk.empty()) {
+				Aws::Vector<unsigned char> bits(chunk.begin(), chunk.end());
+				AudioEvent aev(std::move(bits));
+				if(!stream.WriteAudioEvent(aev)) {
+					/* Mark stream as broken so push_pcm stops accepting data */
+					{
+						std::lock_guard<std::mutex> lk(mu);
+						stream_error = true;
+						/* Drain queue to free memory */
+						while(!q.empty()) q.pop();
+					}
+					/* Include chunk size for diagnosis (credentials/network issues
+					 * often manifest as immediate write failures on the first chunk) */
+					char errmsg[128];
+					snprintf(errmsg, sizeof(errmsg),
+						"WriteAudioEvent failed (chunk=%zu bytes) — check AWS credentials and region",
+						chunk.size());
+					emit_err(errmsg);
+					return;
+				}
+			}
+			}
+		};
+
+		auto on_response = [this, &done](
+				const TranscribeStreamingServiceClient *,
+				const StartMedicalStreamTranscriptionRequest &,
+				const StartMedicalStreamTranscriptionOutcome &outcome,
+				const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
+			if(!outcome.IsSuccess()) {
+				const Aws::String msg = outcome.GetError().GetMessage();
+				bool is_closing = false;
+				{
+					std::lock_guard<std::mutex> lk(mu);
+					is_closing = closing;
+				}
+				if(is_closing) {
+					const std::string s = msg.c_str();
+					const bool benign_shutdown_error =
+						s.find("A complete signal was sent without the preceding empty frame") != std::string::npos ||
+						s.find("timed out because no new audio was received") != std::string::npos;
+					if(!benign_shutdown_error)
+						emit_err(msg.c_str());
+				} else {
+					emit_err(msg.c_str());
+				}
+			}
+			done.Release();
+		};
+
+		client->StartMedicalStreamTranscriptionAsync(request, on_stream_ready, on_response, nullptr);
+		done.WaitOne();
+	}
+};
+
+} /* namespace */
+
+#if ABMOD_HAS_TRANSCRIBE_VOCAB
+
+static Aws::Vector<Aws::String> parse_vocab_phrases(const char *prompt) {
+	Aws::Vector<Aws::String> phrases;
+	if(!prompt || !*prompt)
+		return phrases;
+	std::istringstream ss(prompt);
+	std::string token;
+	while(std::getline(ss, token, ',')) {
+		size_t a = token.find_first_not_of(" \t\r\n");
+		size_t b = token.find_last_not_of(" \t\r\n");
+		if(a != std::string::npos)
+			phrases.push_back(Aws::String(token.substr(a, b - a + 1)));
+	}
+	return phrases;
+}
+
+static std::shared_ptr<Aws::TranscribeService::TranscribeServiceClient>
+make_transcribe_client(const AbmodAwsNativeConfig *cfg) {
+	Aws::Client::ClientConfiguration cc;
+	cc.region = cfg->region ? cfg->region : "us-east-1";
+	if(cfg->access_key_id && *cfg->access_key_id &&
+	   cfg->secret_access_key && *cfg->secret_access_key) {
+		if(cfg->session_token && *cfg->session_token) {
+			
+			ABMOD_LOG("Using AWS credentials from config (session_token=%s)", cfg->session_token);
+			AWSCredentials creds(cfg->access_key_id, cfg->secret_access_key, cfg->session_token);
+			return std::make_shared<Aws::TranscribeService::TranscribeServiceClient>(creds, cc);
+		} else {
+			AWSCredentials creds(cfg->access_key_id, cfg->secret_access_key);
+			return std::make_shared<Aws::TranscribeService::TranscribeServiceClient>(creds, cc);
+		}
+	}
+	return std::make_shared<Aws::TranscribeService::TranscribeServiceClient>(cc);
+}
+
+#endif /* ABMOD_HAS_TRANSCRIBE_VOCAB */
+
+void abmod_aws_native_global_init(void) {
+	std::lock_guard<std::mutex> lk(g_sdk_mutex);
+	if(g_sdk_refcount.fetch_add(1) == 0)
+		InitAPI(g_sdk_options);
+}
+
+void abmod_aws_native_global_shutdown(void) {
+	std::lock_guard<std::mutex> lk(g_sdk_mutex);
+	int v = g_sdk_refcount.fetch_sub(1) - 1;
+	if(v == 0)
+		ShutdownAPI(g_sdk_options);
+}
+
+void *abmod_aws_native_stream_open(const AbmodAwsNativeConfig *cfg,
+		const char *room_id,
+		const char *user_id,
+		abmod_sdk_transcript_fn on_text,
+		abmod_sdk_error_fn on_err,
+		void *user) {
+	if(!cfg || !room_id || !user_id || !on_text || !on_err)
+		return nullptr;
+
+	auto *s = new (std::nothrow) NativeStream();
+	if(!s)
+		return nullptr;
+	s->cb_user = user;
+	s->on_text = on_text;
+	s->on_err = on_err;
+	snprintf(s->room_id, sizeof(s->room_id), "%s", room_id);
+	snprintf(s->user_id, sizeof(s->user_id), "%s", user_id);
+
+	/* Deep-copy all config strings into NativeStream so the worker thread
+	 * never touches a pointer the caller might free after we return. */
+	s->cfg_region           = cfg->region          ? cfg->region          : "us-east-1";
+	s->cfg_language_code    = cfg->language_code    ? cfg->language_code   : "en-US";
+	s->cfg_specialty        = cfg->specialty        ? cfg->specialty       : "PRIMARYCARE";
+	s->cfg_stream_type      = cfg->stream_type      ? cfg->stream_type     : "CONVERSATION";
+	s->cfg_session_id       = cfg->session_id       ? cfg->session_id      : "";
+	s->cfg_access_key_id    = cfg->access_key_id    ? cfg->access_key_id   : "";
+	s->cfg_secret_access_key= cfg->secret_access_key? cfg->secret_access_key: "";
+	s->cfg_session_token    = cfg->session_token    ? cfg->session_token   : "";
+	s->cfg_vocabulary_name  = cfg->vocabulary_name  ? cfg->vocabulary_name : "";
+	s->cfg_sample_rate      = cfg->sample_rate;
+	s->cfg_medical_redaction= cfg->medical_redaction;
+	s->cfg_fast_mode        = cfg->fast_mode ? true : false;
+	ABMOD_LOG("abmod_aws_native_stream_open region=%s language_code=%s specialty=%s stream_type=%s sample_rate=%d medical_redaction=%d fast_mode=%d",
+		cfg->region ? cfg->region : "(null)",
+		cfg->language_code ? cfg->language_code : "(null)",
+		cfg->specialty ? cfg->specialty : "(null)",
+		cfg->stream_type ? cfg->stream_type : "(null)",
+		cfg->sample_rate, cfg->medical_redaction, cfg->fast_mode);
+	s->worker = std::thread([s]() {
+		try {
+			s->run_async();
+		} catch(const std::exception &ex) {
+			s->emit_err(ex.what());
+		} catch(...) {
+			s->emit_err("AWS SDK unknown exception");
+		}
+	});
+
+	return s;
+}
+
+int abmod_aws_native_stream_send_pcm(void *stream,
+		const int16_t *pcm,
+		size_t samples,
+		int channels) {
+	auto *s = static_cast<NativeStream *>(stream);
+	if(!s || !pcm || samples == 0)
+		return -1;
+	s->push_pcm(pcm, samples, channels);
+	return 0;
+}
+
+void abmod_aws_native_stream_close(void *stream) {
+	auto *s = static_cast<NativeStream *>(stream);
+	if(!s)
+		return;
+	s->close_internal();
+	delete s;
+}
+
+#if ABMOD_HAS_TRANSCRIBE_VOCAB
+
+int abmod_aws_native_create_vocabulary_from_prompt(const AbmodAwsNativeConfig *cfg,
+		const char *prompt,
+		char *out_name,
+		size_t out_name_len,
+		int max_wait_seconds,
+		volatile int *cancel) {
+	if(!cfg || !prompt || !*prompt || !out_name || out_name_len == 0)
+		return -1;
+
+	auto phrases = parse_vocab_phrases(prompt);
+	if(phrases.empty())
+		return -1;
+
+	/* Unique temp name based on millisecond timestamp */
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	std::string vocab_name = std::string("abmod-") + std::to_string(ms);
+	if(vocab_name.size() >= out_name_len)
+		return -1;
+
+	auto tc = make_transcribe_client(cfg);
+
+	Aws::TranscribeService::Model::CreateVocabularyRequest req;
+	req.SetVocabularyName(Aws::String(vocab_name));
+	req.SetLanguageCode(Aws::TranscribeService::Model::LanguageCode::en_US);
+	req.SetPhrases(phrases);
+
+	auto outcome = tc->CreateVocabulary(req);
+	if(!outcome.IsSuccess()) {
+		ABMOD_LOG("create_vocabulary failed: %s", outcome.GetError().GetMessage().c_str());
+		return -1;
+	}
+	ABMOD_LOG("vocabulary '%s' created (%zu phrases), polling up to %d s...",
+		vocab_name.c_str(), phrases.size(), max_wait_seconds);
+
+	int steps = (max_wait_seconds > 0 ? max_wait_seconds : 30) / 10;
+	for(int i = 0; i < steps; i++) {
+		if(cancel && *cancel) {
+			ABMOD_LOG("vocabulary '%s' creation cancelled", vocab_name.c_str());
+			Aws::TranscribeService::Model::DeleteVocabularyRequest dr;
+			dr.SetVocabularyName(Aws::String(vocab_name));
+			tc->DeleteVocabulary(dr);
+			return -1;
+		}
+		std::this_thread::sleep_for(std::chrono::seconds(10));
+		if(cancel && *cancel) {
+			ABMOD_LOG("vocabulary '%s' creation cancelled after sleep", vocab_name.c_str());
+			Aws::TranscribeService::Model::DeleteVocabularyRequest dr;
+			dr.SetVocabularyName(Aws::String(vocab_name));
+			tc->DeleteVocabulary(dr);
+			return -1;
+		}
+		Aws::TranscribeService::Model::GetVocabularyRequest gr;
+		gr.SetVocabularyName(Aws::String(vocab_name));
+		auto gs = tc->GetVocabulary(gr);
+		if(!gs.IsSuccess())
+			break;
+		if(gs.GetResult().GetVocabularyState() == Aws::TranscribeService::Model::VocabularyState::READY) {
+			ABMOD_LOG("vocabulary '%s' is READY after ~%d s", vocab_name.c_str(), (i + 1) * 2);
+			snprintf(out_name, out_name_len, "%s", vocab_name.c_str());
+			return 0;
+		}
+	}
+	ABMOD_LOG("vocabulary '%s' did not become READY in time — cleaning up", vocab_name.c_str());
+	Aws::TranscribeService::Model::DeleteVocabularyRequest dr;
+	dr.SetVocabularyName(Aws::String(vocab_name));
+	tc->DeleteVocabulary(dr);
+	return -1;
+}
+
+void abmod_aws_native_delete_vocabulary(const AbmodAwsNativeConfig *cfg,
+		const char *vocab_name) {
+	if(!cfg || !vocab_name || !*vocab_name)
+		return;
+	auto tc = make_transcribe_client(cfg);
+	Aws::TranscribeService::Model::DeleteVocabularyRequest req;
+	req.SetVocabularyName(Aws::String(vocab_name));
+	auto outcome = tc->DeleteVocabulary(req);
+	if(outcome.IsSuccess())
+		ABMOD_LOG("vocabulary '%s' deleted", vocab_name);
+	else
+		ABMOD_LOG("delete_vocabulary '%s' failed: %s", vocab_name, outcome.GetError().GetMessage().c_str());
+}
+
+#else /* !ABMOD_HAS_TRANSCRIBE_VOCAB */
+
+int abmod_aws_native_create_vocabulary_from_prompt(const AbmodAwsNativeConfig *cfg,
+		const char *prompt,
+		char *out_name,
+		size_t out_name_len,
+		int max_wait_seconds,
+		volatile int *cancel) {
+	(void)cfg; (void)prompt; (void)out_name; (void)out_name_len;
+	(void)max_wait_seconds; (void)cancel;
+	ABMOD_LOG("vocabulary creation unavailable (aws-cpp-sdk-transcribe not found at configure time)");
+	return -1;
+}
+
+void abmod_aws_native_delete_vocabulary(const AbmodAwsNativeConfig *cfg,
+		const char *vocab_name) {
+	(void)cfg; (void)vocab_name;
+}
+
+#endif /* ABMOD_HAS_TRANSCRIBE_VOCAB */

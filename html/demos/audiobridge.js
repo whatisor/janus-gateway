@@ -1,495 +1,446 @@
-// We import the settings.js file to know which address we should contact
-// to talk to Janus, and optionally which STUN/TURN servers should be
-// used as well. Specifically, that file defines the "server" and
-// "iceServers" properties we'll pass when creating the Janus session.
-
-/* global iceServers:readonly, Janus:readonly, server:readonly */
+/* global server:readonly, iceServers:readonly, Janus:readonly */
 
 var janus = null;
-var mixertest = null;
-var opaqueId = "audiobridgetest-"+Janus.randomString(12);
+var audiobridgeHandle = null;
+var opaqueId = "audiobridge-" + Janus.randomString(12);
 
-var remoteStream = null;
-
-var myroom = 1234;	// Demo room
-if(getQueryStringValue("room") !== "")
-	myroom = parseInt(getQueryStringValue("room"));
-var acodec = (getQueryStringValue("acodec") !== "" ? getQueryStringValue("acodec") : null);
-var stereo = false;
-if(getQueryStringValue("stereo") !== "")
-	stereo = (getQueryStringValue("stereo") === "true");
-var mygroup = null;	// Forwarding group, if required by the room
-if(getQueryStringValue("group") !== "")
-	mygroup = getQueryStringValue("group");
+var myroom = 1234;
 var myusername = null;
 var myid = null;
 var webrtcUp = false;
-var audioenabled = false;
-var audiosuspended = (getQueryStringValue("suspended") !== "") ? (getQueryStringValue("suspended") === "true") : false;
 
+var ABMOD_SO_PATH = '/var/janus/janus/lib/janus/abmodules/libabmod_transcriber_template.so';
 
-$(document).ready(function() {
-	// Initialize the library (all console debuggers enabled)
-	Janus.init({debug: "all", callback: function() {
-		// Use a button to start the demo
-		$('#start').one('click', function() {
-			$(this).attr('disabled', true).unbind('click');
-			// Make sure the browser supports WebRTC
-			if(!Janus.isWebrtcSupported()) {
-				bootbox.alert("No WebRTC support... ");
+// STT display state
+var sttPartialItems = {};
+var sttKnownUsers  = {};
+
+// ─── STT helpers ────────────────────────────────────────────────────────────
+
+function sttRememberUser(id, display) {
+	if(id !== undefined && id !== null) sttKnownUsers[String(id)] = display || ("User " + id);
+	if(display) sttKnownUsers[String(display)] = display;
+}
+
+function sttResolveName(u) {
+	if(u && sttKnownUsers[String(u)]) return sttKnownUsers[String(u)];
+	if(u && /[^0-9]/.test(String(u))) return String(u);
+	return null;
+}
+
+function sttResolveMultiple(u) {
+	if(!u) return null;
+	if(String(u).includes(','))
+		return String(u).split(',').map(x => sttResolveName(x.trim()) || x.trim()).join(', ');
+	return sttResolveName(u);
+}
+
+function escapeHtml(v) {
+	if(!v) return '';
+	return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function sttUpdatePartial(itemId, userKey, displayName, text) {
+	var ul = document.getElementById('sttConversation');
+	if(!ul || !text || !text.trim()) return;
+	var key = itemId || 'unknown';
+	var item = sttPartialItems[key];
+	if(!item) {
+		var li = document.createElement('li');
+		li.className = 'list-group-item list-group-item-info';
+		li.style.opacity = '0.7';
+		item = { li: li, displayName: displayName };
+		sttPartialItems[key] = item;
+		ul.appendChild(li);
+	}
+	item.displayName = displayName || item.displayName;
+	item.li.innerHTML = '<strong>' + escapeHtml(item.displayName || userKey) + ':</strong> ' +
+		escapeHtml(text) + ' <em class="text-muted">(partial)</em>';
+	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
+}
+
+function sttFinalize(itemId, userKey, displayName, text) {
+	var ul = document.getElementById('sttConversation');
+	if(!ul) return;
+	var key = itemId || 'unknown';
+	var item = sttPartialItems[key];
+	var finalText = (text && text.trim()) ? text : (item ? item.text : '');
+	if(item && item.li) { try { ul.removeChild(item.li); } catch(e) {} delete sttPartialItems[key]; }
+	if(!finalText) return;
+	var li = document.createElement('li');
+	li.className = 'list-group-item list-group-item-light';
+	var ts = new Date().toLocaleTimeString();
+	li.innerHTML = '<small class="text-muted">[' + ts + ']</small> ' +
+		'<strong>' + escapeHtml(displayName || userKey || 'Unknown') + ':</strong> ' + escapeHtml(finalText);
+	ul.appendChild(li);
+	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
+}
+
+function sttAppendError(who, msg) {
+	var ul = document.getElementById('sttConversation');
+	if(!ul) return;
+	var li = document.createElement('li');
+	li.className = 'list-group-item list-group-item-danger';
+	li.innerHTML = '<strong>' + escapeHtml(who || 'STT') + ':</strong> ' + escapeHtml(msg);
+	ul.appendChild(li);
+	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
+}
+
+function sttNormalizeAbmod(msg) {
+	var payload = msg && (msg.payload || msg.data) ? (msg.payload || msg.data) : {};
+	var sttEvent = (msg && (msg.event || msg.type)) || payload.event || '';
+	var payloadType = payload.type || '';
+	var userField = payload.user_id || payload.userId || payload.user || '';
+	var itemId = payload.item_id || payload.itemId || payload.id || null;
+	var text = payload.text || payload.message || '';
+	var provider = payload.provider || '';
+	var language = payload.language || payload.lang || '';
+	return {
+		event: sttEvent,
+		type: payloadType,
+		userField: userField,
+		itemId: itemId,
+		text: text,
+		provider: provider,
+		language: language,
+		payload: payload
+	};
+}
+
+// ─── ABMod config ────────────────────────────────────────────────────────────
+
+function generateUUID() {
+	return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+		var r = Math.random() * 16 | 0;
+		return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+	});
+}
+
+function buildAbmodConfig() {
+	var provider = $('#sttProvider').val() || 'aws';
+	if(provider === 'openai') {
+		var cfg = {
+			provider: 'openai',
+			openai_model: $('#openaiModel').val() || 'gpt-4o-transcribe',
+			openai_language: 'en'
+		};
+		var concurrent = parseInt($('#openaiConcurrent').val(), 10);
+		if(concurrent > 1) cfg.openai_concurrent = concurrent;
+		if($('#openaiFastMode').is(':checked')) cfg.openai_fast_mode = true;
+		return cfg;
+	}
+	var awsCfg = {
+		provider: 'aws',
+		aws_language_code: 'en-US',
+		aws_region: 'us-east-1',
+		aws_specialty: 'PRIMARYCARE',
+		aws_stream_type: 'CONVERSATION',
+		aws_session_id: generateUUID(),
+		aws_medical_redaction: false,
+		aws_fast_mode: $('#awsFastMode').is(':checked'),
+		aws_vocabulary_name:'test'
+	};
+	var vocabPrompt = $('#awsVocabPrompt').val().trim();
+	if(vocabPrompt) awsCfg.aws_vocabulary_prompt = vocabPrompt;
+	return awsCfg;
+}
+
+// ─── Room bootstrap ───────────────────────────────────────────────────────────
+
+function doJoin() {
+	audiobridgeHandle.send({
+		message: { request: 'join', room: myroom, display: myusername }
+	});
+}
+
+function createRoomThenJoin() {
+	audiobridgeHandle.send({
+		message: {
+			request: 'create',
+			room: myroom,
+			description: 'AudioBridge room ' + myroom,
+			is_private: false,
+			sampling_rate: 16000,
+			permanent: false
+		},
+		success: function(result) {
+			Janus.log('Room create result:', result);
+			doJoin();
+		},
+		error: function(err) {
+			// 486 = room already exists — race condition, just join anyway
+			if(err && (Number(err['error_code']) === 486 || String(err).toLowerCase().includes('already exists'))) {
+				Janus.log('Room already exists, joining...');
+				doJoin();
 				return;
 			}
-			// Create session
-			janus = new Janus(
-				{
-					server: server,
-					iceServers: iceServers,
-					// Should the Janus API require authentication, you can specify either the API secret or user token here too
-					//		token: "mytoken",
-					//	or
-					//		apisecret: "serversecret",
-					success: function() {
-						// Attach to AudioBridge plugin
-						janus.attach(
-							{
-								plugin: "janus.plugin.audiobridge",
-								opaqueId: opaqueId,
-								success: function(pluginHandle) {
-									$('#details').remove();
-									mixertest = pluginHandle;
-									Janus.log("Plugin attached! (" + mixertest.getPlugin() + ", id=" + mixertest.getId() + ")");
-									// Prepare the username registration
-									$('#audiojoin').removeClass('hide');
-									$('#registernow').removeClass('hide');
-									$('#register').click(registerUsername);
-									$('#username').focus();
-									$('#start').removeAttr('disabled').html("Stop")
-										.click(function() {
-											$(this).attr('disabled', true);
-											janus.destroy();
-										});
-								},
-								error: function(error) {
-									Janus.error("  -- Error attaching plugin...", error);
-									bootbox.alert("Error attaching plugin... " + error);
-								},
-								consentDialog: function(on) {
-									Janus.debug("Consent dialog should be " + (on ? "on" : "off") + " now");
-									if(on) {
-										// Darken screen and show hint
-										$.blockUI({
-											message: '<div><img src="up_arrow.png"/></div>',
-											baseZ: 3001,
-											css: {
-												border: 'none',
-												padding: '15px',
-												backgroundColor: 'transparent',
-												color: '#aaa',
-												top: '10px',
-												left: '100px'
-											} });
-									} else {
-										// Restore screen
-										$.unblockUI();
-									}
-								},
-								iceState: function(state) {
-									Janus.log("ICE state changed to " + state);
-								},
-								mediaState: function(medium, on, mid) {
-									Janus.log("Janus " + (on ? "started" : "stopped") + " receiving our " + medium + " (mid=" + mid + ")");
-								},
-								webrtcState: function(on) {
-									Janus.log("Janus says our WebRTC PeerConnection is " + (on ? "up" : "down") + " now");
-								},
-								onmessage: function(msg, jsep) {
-									Janus.debug(" ::: Got a message :::", msg);
-									let event = msg["audiobridge"];
-									Janus.debug("Event: " + event);
-									if(event) {
-										if(event === "joined") {
-											// Successfully joined, negotiate WebRTC now
-											if(msg["id"]) {
-												myid = msg["id"];
-												Janus.log("Successfully joined room " + msg["room"] + " with ID " + myid);
-												if(!webrtcUp) {
-													webrtcUp = true;
-													// Publish our stream
-													mixertest.createOffer(
-														{
-															// We only want bidirectional audio
-															tracks: [
-																{ type: 'audio', capture: true, recv: true },
-															],
-															customizeSdp: function(jsep) {
-																if(stereo && jsep.sdp.indexOf("stereo=1") == -1) {
-																	// Make sure that our offer contains stereo too
-																	jsep.sdp = jsep.sdp.replace("useinbandfec=1", "useinbandfec=1;stereo=1");
-																	// Create a spinner waiting for the remote video
-																	$('#mixedaudio').html(
-																		'<div class="text-center">' +
-																		'	<div id="spinner" class="spinner-border" role="status">' +
-																		'		<span class="visually-hidden">Loading...</span>' +
-																		'	</div>' +
-																		'</div>');
-																}
-															},
-															success: function(jsep) {
-																Janus.debug("Got SDP!", jsep);
-																let publish = { request: "configure", muted: false };
-																mixertest.send({ message: publish, jsep: jsep });
-															},
-															error: function(error) {
-																Janus.error("WebRTC error:", error);
-																bootbox.alert("WebRTC error... " + error.message);
-															}
-														});
-												}
-											}
-											// Any room participant?
-											if(msg["participants"]) {
-												let list = msg["participants"];
-												Janus.debug("Got a list of participants:", list);
-												for(let f in list) {
-													let id = list[f]["id"];
-													let display = escapeXmlTags(list[f]["display"]);
-													let setup = list[f]["setup"];
-													let muted = list[f]["muted"];
-													let suspended = list[f]["suspended"];
-													let spatial = list[f]["spatial_position"];
-													Janus.debug("  >> [" + id + "] " + display + " (setup=" + setup + ", muted=" + muted + ")");
-													if($('#rp' + id).length === 0) {
-														// Add to the participants list
-														let slider = '';
-														if(spatial !== null && spatial !== undefined)
-															slider = '<span>[L <input id="sp' + id + '" type="text" style="width: 10%;"/> R] </span>';
-														$('#list').append('<li id="rp' + id +'" class="list-group-item">' +
-															slider +
-															display +
-															' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
-															' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
-															' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
-														if(spatial !== null && spatial !== undefined) {
-															$('#sp' + id).slider({ min: 0, max: 100, step: 1, value: 50, handle: 'triangle', enabled: false });
-															$('#position').removeClass('hide');
-														}
-														$('#rp' + id + ' > i').addClass('hide');
-													}
-													if(muted === true || muted === "true")
-														$('#rp' + id + ' > i.abmuted').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.abmuted').addClass('hide');
-													if(setup === true || setup === "true")
-														$('#rp' + id + ' > i.absetup').addClass('hide');
-													else
-														$('#rp' + id + ' > i.absetup').removeClass('hide');
-													if(suspended === true)
-														$('#rp' + id + ' > i.absusp').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.absusp').addClass('hide');
-													if(spatial !== null && spatial !== undefined)
-														$('#sp' + id).slider('setValue', spatial);
-												}
-											}
-										} else if(event === "roomchanged") {
-											// The user switched to a different room
-											myid = msg["id"];
-											Janus.log("Moved to room " + msg["room"] + ", new ID: " + myid);
-											// Any room participant?
-											$('#list').empty();
-											if(msg["participants"]) {
-												let list = msg["participants"];
-												Janus.debug("Got a list of participants:", list);
-												for(let f in list) {
-													let id = list[f]["id"];
-													let display = escapeXmlTags(list[f]["display"]);
-													let setup = list[f]["setup"];
-													let muted = list[f]["muted"];
-													let suspended = list[f]["suspended"];
-													let spatial = list[f]["spatial_position"];
-													Janus.debug("  >> [" + id + "] " + display + " (setup=" + setup + ", muted=" + muted + ")");
-													if($('#rp' + id).length === 0) {
-														// Add to the participants list
-														let slider = '';
-														if(spatial !== null && spatial !== undefined)
-															slider = '<span>[L <input id="sp' + id + '" type="text" style="width: 10%;"/> R] </span>';
-														$('#list').append('<li id="rp' + id +'" class="list-group-item">' +
-															slider +
-															display +
-																' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
-																' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
-																' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
-														if(spatial !== null && spatial !== undefined) {
-															$('#sp' + id).slider({ min: 0, max: 100, step: 1, value: 50, handle: 'triangle', enabled: false });
-															$('#position').removeClass('hide');
-														}
-														$('#rp' + id + ' > i').addClass('hide');
-													}
-													if(muted === true || muted === "true")
-														$('#rp' + id + ' > i.abmuted').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.abmuted').addClass('hide');
-													if(setup === true || setup === "true")
-														$('#rp' + id + ' > i.absetup').addClass('hide');
-													else
-														$('#rp' + id + ' > i.absetup').removeClass('hide');
-													if(suspended === true)
-														$('#rp' + id + ' > i.absusp').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.absusp').addClass('hide');
-													if(spatial !== null && spatial !== undefined)
-														$('#sp' + id).slider('setValue', spatial);
-												}
-											}
-										} else if(event === "destroyed") {
-											// The room has been destroyed
-											Janus.warn("The room has been destroyed!");
-											bootbox.alert("The room has been destroyed", function() {
-												window.location.reload();
-											});
-										} else if(event === "event") {
-											if(msg["participants"]) {
-												if(msg["resumed"]) {
-													// This is a full recap after a suspend: clear the list of participants
-													$('#list').empty();
-												}
-												let list = msg["participants"];
-												Janus.debug("Got a list of participants:", list);
-												for(let f in list) {
-													let id = list[f]["id"];
-													let display = escapeXmlTags(list[f]["display"]);
-													let setup = list[f]["setup"];
-													let muted = list[f]["muted"];
-													let suspended = list[f]["suspended"];
-													let spatial = list[f]["spatial_position"];
-													Janus.debug("  >> [" + id + "] " + display + " (setup=" + setup + ", muted=" + muted + ")");
-													if($('#rp' + id).length === 0) {
-														// Add to the participants list
-														let slider = '';
-														if(spatial !== null && spatial !== undefined)
-															slider = '<span>[L <input id="sp' + id + '" type="text" style="width: 10%;"/> R] </span>';
-														$('#list').append('<li id="rp' + id +'" class="list-group-item">' +
-															slider +
-															display +
-																' <i class="absetup fa-solid fa-link-slash" title="No PeerConnection"></i>' +
-																' <i class="absusp fa-solid fa-eye-slash" title="Suspended"></i>' +
-																' <i class="abmuted fa-solid fa-microphone-slash" title="Muted"></i></li>');
-														if(spatial !== null && spatial !== undefined) {
-															$('#sp' + id).slider({ min: 0, max: 100, step: 1, value: 50, handle: 'triangle', enabled: false });
-															$('#position').removeClass('hide');
-														}
-														$('#rp' + id + ' > i').addClass('hide');
-													}
-													if(muted === true || muted === "true")
-														$('#rp' + id + ' > i.abmuted').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.abmuted').addClass('hide');
-													if(setup === true || setup === "true")
-														$('#rp' + id + ' > i.absetup').addClass('hide');
-													else
-														$('#rp' + id + ' > i.absetup').removeClass('hide');
-													if(suspended === true)
-														$('#rp' + id + ' > i.absusp').removeClass('hide');
-													else
-														$('#rp' + id + ' > i.absusp').addClass('hide');
-													if(spatial !== null && spatial !== undefined)
-														$('#sp' + id).slider('setValue', spatial);
-												}
-											} else if(msg["suspended"]) {
-												let id = msg["suspended"];
-												$('#rp' + id + ' > i.absusp').removeClass('hide');
-											} else if(msg["resumed"]) {
-												let id = msg["resumed"];
-												$('#rp' + id + ' > i.absusp').addClass('hide');
-											} else if(msg["error"]) {
-												if(msg["error_code"] === 485) {
-													// This is a "no such room" error: give a more meaningful description
-													bootbox.alert(
-														"<p>Apparently room <code>" + myroom + "</code> (the one this demo uses as a test room) " +
-														"does not exist...</p><p>Do you have an updated <code>janus.plugin.audiobridge.jcfg</code> " +
-														"configuration file? If not, make sure you copy the details of room <code>" + myroom + "</code> " +
-														"from that sample in your current configuration file, then restart Janus and try again."
-													);
-												} else {
-													bootbox.alert(msg["error"]);
-												}
-												return;
-											}
-											// Any new feed to attach to?
-											if(msg["leaving"]) {
-												// One of the participants has gone away?
-												let leaving = msg["leaving"];
-												Janus.log("Participant left: " + leaving + " (we have " + $('#rp'+leaving).length + " elements with ID #rp" +leaving + ")");
-												$('#rp'+leaving).remove();
-											}
-										}
-									}
-									if(jsep) {
-										Janus.debug("Handling SDP as well...", jsep);
-										mixertest.handleRemoteJsep({ jsep: jsep });
-									}
-								},
-								onlocaltrack: function(track, on) {
-									Janus.debug("Local track " + (on ? "added" : "removed") + ":", track);
-									// We're not going to attach the local audio stream
-									$('#audiojoin').addClass('hide');
-									$('#room').removeClass('hide');
-									$('#participant').removeClass('hide').html(myusername).removeClass('hide');
-								},
-								onremotetrack: function(track, mid, on, metadata) {
-									Janus.debug(
-										"Remote track (mid=" + mid + ") " +
-										(on ? "added" : "removed") +
-										(metadata ? " (" + metadata.reason + ") " : "") + ":", track
-									);
-									if(remoteStream || track.kind !== "audio")
-										return;
-									if(!on) {
-										// Track removed, get rid of the stream and the rendering
-										remoteStream = null;
-										$('#roomaudio').remove();
-										return;
-									}
-									$('#spinner').remove();
-									remoteStream = new MediaStream([track]);
-									$('#room').removeClass('hide');
-									if($('#roomaudio').length === 0) {
-										$('#mixedaudio').append('<audio class="rounded centered w-100" id="roomaudio" controls autoplay/>');
-										$('#roomaudio').get(0).volume = 0;
-									}
-									Janus.attachMediaStream($('#roomaudio').get(0), remoteStream);
-									$('#roomaudio').get(0).play();
-									$('#roomaudio').get(0).volume = 1;
-									// Mute button
-									audioenabled = true;
-									$('#toggleaudio').click(
-										function() {
-											audioenabled = !audioenabled;
-											if(audioenabled)
-												$('#toggleaudio').html("Mute").removeClass("btn-success").addClass("btn-danger");
-											else
-												$('#toggleaudio').html("Unmute").removeClass("btn-danger").addClass("btn-success");
-											mixertest.send({ message: { request: "configure", muted: !audioenabled }});
-										}).removeClass('hide');
-									// Suspend button
-									if(!audiosuspended)
-										$('#togglesuspend').html("Suspend").removeClass("btn-info").addClass("btn-secondary");
-									else
-										$('#togglesuspend').html("Resume").removeClass("btn-secondary").addClass("btn-info");
-									$('#togglesuspend').click(
-										function() {
-											audiosuspended = !audiosuspended;
-											if(!audiosuspended)
-												$('#togglesuspend').html("Suspend").removeClass("btn-info").addClass("btn-secondary");
-											else
-												$('#togglesuspend').html("Resume").removeClass("btn-secondary").addClass("btn-info");
-											mixertest.send({ message: {
-												request: (audiosuspended ? "suspend" : "resume"),
-												room: myroom,
-												id: myid
-											}});
-										}).removeClass('hide');
-									// Spatial position, if enabled
-									$('#position').click(
-										function() {
-											bootbox.prompt("Insert new spatial position: [0-100] (0=left, 50=center, 100=right)", function(result) {
-												let spatial = parseInt(result);
-												if(isNaN(spatial) || spatial < 0 || spatial > 100) {
-													bootbox.alert("Invalid value");
-													return;
-												}
-												mixertest.send({ message: { request: "configure", spatial_position: spatial }});
-											});
-										});
-								},
-								oncleanup: function() {
-									webrtcUp = false;
-									Janus.log(" ::: Got a cleanup notification :::");
-									$('#participant').empty().addClass('hide');
-									$('#list').empty();
-									$('#mixedaudio').empty();
-									$('#room').addClass('hide');
-									remoteStream = null;
-								}
-							});
-					},
-					error: function(error) {
-						Janus.error(error);
-						bootbox.alert(error, function() {
-							window.location.reload();
-						});
-					},
-					destroyed: function() {
-						window.location.reload();
-					}
-				});
+			Janus.error('Failed to create room:', err);
+			bootbox.alert('Failed to create room ' + myroom + ': ' + (err['error'] || err));
+			$('#registernow').removeClass('hide');
+		}
+	});
+}
+
+// ─── Message handler ─────────────────────────────────────────────────────────
+
+function handleMessage(msg, jsep) {
+	var event = msg['audiobridge'];
+	Janus.log('AudioBridge event:', event, msg);
+
+	if(event === 'joined') {
+		myid = msg['id'];
+		myusername = msg['display'];
+		sttRememberUser(myid, myusername);
+		Janus.log('Joined room', myroom, 'as', myid);
+		$('#you').text('You: ' + myusername).removeClass('hide');
+		$('#toggleaudio').removeClass('hide');
+		$('#togglesuspend').removeClass('hide');
+		$('#loadabmod').prop('disabled', false);
+		// Build participant list from existing members
+		var list = msg['participants'];
+		if(list && list.length > 0) {
+			list.forEach(function(p) {
+				sttRememberUser(p['id'], p['display']);
+				addParticipant(p['id'], p['display'], p['muted']);
+			});
+		}
+		if(!webrtcUp) {
+			webrtcUp = true;
+			setupWebRTC();
+		}
+	}
+
+	if(event === 'roomchanged') {
+		myid = msg['id'];
+		$('#list').empty();
+	}
+
+	if(event === 'destroyed') {
+		bootbox.alert('Room destroyed!', function() { window.location.reload(); });
+	}
+
+	if(event === 'event') {
+		// Participant list changes
+		var participants = msg['participants'];
+		if(participants && participants.length > 0) {
+			participants.forEach(function(p) {
+				sttRememberUser(p['id'], p['display']);
+				if($('#rp' + p['id']).length === 0)
+					addParticipant(p['id'], p['display'], p['muted']);
+				else
+					$('#rp' + p['id'] + ' i').toggleClass('fa-microphone', !p['muted']).toggleClass('fa-microphone-slash', !!p['muted']);
+			});
+		}
+		var leaving = msg['leaving'];
+		if(leaving) removeParticipant(leaving);
+		var kicked = msg['kicked'];
+		if(kicked) removeParticipant(kicked);
+		var error = msg['error'];
+		var errorCode = Number(msg['error_code']);
+		if(error) {
+			Janus.error('AudioBridge error ' + errorCode + ':', error);
+			if(errorCode === 485) {
+				// Room does not exist — create it then retry join
+				Janus.log('Room', myroom, 'not found, creating it...');
+				createRoomThenJoin();
+				return;
+			}
+			bootbox.alert(error);
+		}
+		// Mute toggle confirmation
+		if(msg['result'] && msg['result'] === 'ok') { /* configure ack */ }
+	}
+
+	// ABMod transcription events
+	// ABMod emits exactly two event types:
+	//   event='transcription'  payload.type='partial'|'final'  payload.item_id=<aws-result-uuid>
+	//   event='error'          payload.type='error'|'auth_error'
+	if(event === 'abmod') {
+		var stt = sttNormalizeAbmod(msg);
+		var sttType = stt.event;
+		var payload = stt.payload;
+		var userField = stt.userField;
+		var itemId = stt.itemId;
+		var text = stt.text;
+		var payloadType = stt.type;
+		var who = sttResolveMultiple(userField) || 'Unknown';
+		if(userField && who)
+			sttRememberUser(userField, who);
+
+		if(sttType === 'transcription' || sttType === 'transcript') {
+			$('#sttStatus').text(payloadType === 'final' ? 'final' : 'listening\u2026');
+			if(payloadType === 'partial') {
+				sttUpdatePartial(itemId, String(userField), who, text);
+			} else if(payloadType === 'final' || !payloadType) {
+				/* Treat missing type as finalized text for compatibility with older emitters. */
+				sttFinalize(itemId, String(userField), who, text);
+			}
+		} else if(sttType === 'error') {
+			$('#sttStatus').text('error');
+			var errTag = payloadType ? ('[' + payloadType + '] ') : '';
+			var whoTag = who ? who : (payload.provider || 'STT');
+			sttAppendError(errTag + whoTag, text || 'Unknown STT error');
+		}
+		return;
+	}
+
+	if(jsep) {
+		Janus.log('Handling SDP:', jsep);
+		audiobridgeHandle.handleRemoteJsep({ jsep: jsep });
+	}
+}
+
+// ─── Participant list ─────────────────────────────────────────────────────────
+
+function addParticipant(id, display, muted) {
+	if($('#rp' + id).length > 0) return;
+	var icon = muted ? 'fa-microphone-slash' : 'fa-microphone';
+	var li = $('<li id="rp' + id + '" class="list-group-item">' +
+		'<i class="fa-solid ' + icon + ' me-2"></i>' + escapeHtml(display || id) + '</li>');
+	$('#list').append(li);
+}
+
+function removeParticipant(id) {
+	$('#rp' + id).remove();
+}
+
+// ─── WebRTC ───────────────────────────────────────────────────────────────────
+
+function setupWebRTC() {
+	audiobridgeHandle.createOffer({
+		tracks: [{ type: 'audio', capture: true, recv: true }],
+		success: function(jsep) {
+			Janus.log('Got SDP:', jsep);
+			audiobridgeHandle.send({ message: { request: 'configure', muted: false }, jsep: jsep });
+		},
+		error: function(error) {
+			Janus.error('WebRTC error:', error);
+			bootbox.alert('WebRTC error: ' + error.message);
+		}
+	});
+}
+
+// ─── Document ready ───────────────────────────────────────────────────────────
+
+$(document).ready(function() {
+	$('#room').addClass('hide');
+	$('#audiojoin').addClass('hide');
+
+	Janus.init({ debug: 'all', callback: function() {
+		$('#start').one('click', function() {
+			$(this).attr('disabled', true);
+			if(!Janus.isWebrtcSupported()) {
+				bootbox.alert('No WebRTC support in this browser!');
+				return;
+			}
+			janus = new Janus({
+				server: server,
+				iceServers: iceServers,
+				success: function() {
+					janus.attach({
+						plugin: 'janus.plugin.audiobridge',
+						opaqueId: opaqueId,
+						success: function(handle) {
+							audiobridgeHandle = handle;
+							$('#details').addClass('hide');
+							$('#audiojoin').removeClass('hide');
+							$('#registernow').removeClass('hide');
+						},
+						error: function(err) {
+							Janus.error('Error attaching:', err);
+							bootbox.alert('Error attaching to AudioBridge: ' + err);
+						},
+						iceState: function(state) { Janus.log('ICE state:', state); },
+						mediaState: function(medium, on) { Janus.log('Janus', on ? 'started' : 'stopped', 'receiving', medium); },
+						webrtcState: function(on) {
+							Janus.log('WebRTC PeerConnection is', on ? 'up' : 'down');
+							$('#toggleaudio').prop('disabled', !on);
+						},
+						onmessage: function(msg, jsep) { handleMessage(msg, jsep); },
+						onlocaltrack: function(track, on) { Janus.log('Local track', on ? 'added' : 'removed', track); },
+						onremotetrack: function(track, mid, on) {
+							Janus.log('Remote track', on ? 'added' : 'removed', track);
+							if(track.kind !== 'audio') return;
+							var audio = $('#mixedaudio audio').get(0);
+							if(!on) { if(audio) audio.srcObject = null; return; }
+							if(!audio) {
+								audio = document.createElement('audio');
+								audio.autoplay = true;
+								audio.controls = true;
+								audio.style.width = '100%';
+								$('#mixedaudio').append(audio);
+							}
+							var stream = audio.srcObject;
+							if(!stream) { stream = new MediaStream(); audio.srcObject = stream; }
+							stream.addTrack(track);
+							audio.play().catch(function(e) { Janus.warn('Remote audio autoplay blocked:', e); });
+						},
+						oncleanup: function() {
+							Janus.log('Cleanup');
+							webrtcUp = false;
+							myid = null;
+							$('#room').addClass('hide');
+							$('#audiojoin').removeClass('hide');
+						}
+					});
+				},
+				error: function(err) { Janus.error(err); bootbox.alert(err, function() { window.location.reload(); }); },
+				destroyed: function() { window.location.reload(); }
+			});
 		});
 	}});
+
+	// Join — try to join; if room missing, auto-create then retry
+	$('#register').on('click', function() {
+		var username = $('#username').val().trim();
+		if(!username) { bootbox.alert('Enter a display name'); return; }
+		myusername = username;
+		$('#registernow').addClass('hide');
+		$('#audiojoin').addClass('hide');
+		$('#room').removeClass('hide');
+		doJoin();
+	});
+
+	// Enter key in username field
+	$('#username').on('keypress', function(e) {
+		if(e.which === 13) $('#register').trigger('click');
+	});
+
+	// Mute/unmute own mic
+	$('#toggleaudio').on('click', function() {
+		var muted = audiobridgeHandle.isAudioMuted();
+		if(muted) { audiobridgeHandle.unmuteAudio(); $(this).text('Mute').removeClass('btn-success').addClass('btn-danger'); }
+		else       { audiobridgeHandle.muteAudio();   $(this).text('Unmute').removeClass('btn-danger').addClass('btn-success'); }
+		audiobridgeHandle.send({ message: { request: 'configure', muted: !muted } });
+	});
+
+	// Show/hide provider-specific config fields
+	$('#sttProvider').on('change', function() {
+		var isOpenai = $(this).val() === 'openai';
+		$('#openaiConfig').toggleClass('d-none', !isOpenai);
+		$('#awsConfig').toggleClass('d-none', isOpenai);
+	});
+
+	// Load ABMod
+	$('#loadabmod').on('click', function() {
+		if(!myid) return;
+		var cfg = buildAbmodConfig();
+		audiobridgeHandle.send({ message: {
+			request: 'configure',
+			abmod_load: ABMOD_SO_PATH,
+			abmod_config: JSON.stringify(cfg)
+		}});
+		$(this).prop('disabled', true);
+		$('#unloadabmod').prop('disabled', false);
+		$('#sttStatus').text('loading\u2026');
+	});
+
+	// Unload ABMod
+	$('#unloadabmod').on('click', function() {
+		if(!myid) return;
+		audiobridgeHandle.send({ message: { request: 'configure', abmod_unload: true } });
+		$(this).prop('disabled', true);
+		$('#loadabmod').prop('disabled', false);
+		$('#sttStatus').text('idle');
+	});
 });
-
-// eslint-disable-next-line no-unused-vars
-function checkEnter(field, event) {
-	let theCode = event.keyCode ? event.keyCode : event.which ? event.which : event.charCode;
-	if(theCode == 13) {
-		registerUsername();
-		return false;
-	} else {
-		return true;
-	}
-}
-
-function registerUsername() {
-	if($('#username').length === 0) {
-		// Create fields to register
-		$('#register').click(registerUsername);
-		$('#username').focus();
-	} else {
-		// Try a registration
-		$('#username').attr('disabled', true);
-		$('#register').attr('disabled', true).unbind('click');
-		let username = $('#username').val();
-		if(username === "") {
-			$('#you')
-				.removeClass().addClass('badge bg-warning')
-				.html("Insert your display name (e.g., pippo)");
-			$('#username').removeAttr('disabled');
-			$('#register').removeAttr('disabled').click(registerUsername);
-			return;
-		}
-		if(/[^a-zA-Z0-9]/.test(username)) {
-			$('#you')
-				.removeClass().addClass('badge bg-warning')
-				.html('Input is not alphanumeric');
-			$('#username').removeAttr('disabled').val("");
-			$('#register').removeAttr('disabled').click(registerUsername);
-			return;
-		}
-		let register = { request: "join", room: myroom, display: username, suspended: audiosuspended };
-		myusername = escapeXmlTags(username);
-		// Check if we need to join using G.711 instead of (default) Opus
-		if(acodec === 'opus' || acodec === 'pcmu' || acodec === 'pcma')
-			register.codec = acodec;
-		// If the room uses forwarding groups, this is how we state ours
-		if(mygroup)
-			register["group"] = mygroup;
-		// Send the message
-		mixertest.send({ message: register });
-	}
-}
-
-// Helper to parse query string
-function getQueryStringValue(name) {
-	name = name.replace(/[[]/, "\\[").replace(/[\]]/, "\\]");
-	let regex = new RegExp("[\\?&]" + name + "=([^&#]*)"),
-		results = regex.exec(location.search);
-	return results === null ? "" : decodeURIComponent(results[1].replace(/\+/g, " "));
-}
-
-// Helper to escape XML tags
-function escapeXmlTags(value) {
-	if(value) {
-		let escapedValue = value.replace(new RegExp('<', 'g'), '&lt');
-		escapedValue = escapedValue.replace(new RegExp('>', 'g'), '&gt');
-		return escapedValue;
-	}
-}

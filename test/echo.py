@@ -9,7 +9,8 @@ import websockets as ws
 import json
 
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+import re
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiortc.contrib.media import MediaPlayer
 
@@ -169,7 +170,34 @@ class JanusSession:
             await asyncio.sleep(self._ka_interval)
 
 
-async def run(pc, player, session, bitrate=512000, record=False):
+def _filter_sdp_candidates(sdp: str, allow_ip: str = None, allow_prefix: str = None) -> str:
+    if not allow_ip and not allow_prefix:
+        return sdp
+    lines = sdp.splitlines()
+    out = []
+    for line in lines:
+        if line.startswith('a=candidate:'):
+            parts = line.split()
+            # candidate:<foundation> <comp> <proto> <priority> <ip> <port> typ <type> ...
+            ip = parts[4] if len(parts) > 5 else ''
+            if allow_ip and ip == allow_ip:
+                out.append(line)
+            elif allow_prefix and ip.startswith(allow_prefix):
+                out.append(line)
+            elif ip == '127.0.0.1' and (allow_ip == '127.0.0.1' or (allow_prefix and allow_prefix.startswith('127.'))):
+                out.append(line)
+            else:
+                # drop this candidate
+                continue
+        elif line.startswith('a=ice-options:') or line.startswith('a=end-of-candidates'):
+            # keep signaling lines
+            out.append(line)
+        else:
+            out.append(line)
+    return '\r\n'.join(out) + ('\r\n' if not sdp.endswith('\r\n') else '')
+
+
+async def run(pc, player, session, bitrate=512000, record=False, allow_ip=None, allow_prefix=None):
     @pc.on('track')
     def on_track(track):
         logger.info(f'Track {track.kind} received')
@@ -230,7 +258,13 @@ async def run(pc, player, session, bitrate=512000, record=False):
             dc_probe_received = True
 
     # send offer
-    await pc.setLocalDescription(await pc.createOffer())
+    offer = await pc.createOffer()
+    # Optionally filter local candidates to a specific IP/prefix
+    if allow_ip or allow_prefix:
+        filtered_sdp = _filter_sdp_candidates(offer.sdp, allow_ip=allow_ip, allow_prefix=allow_prefix)
+        await pc.setLocalDescription(RTCSessionDescription(sdp=filtered_sdp, type=offer.type))
+    else:
+        await pc.setLocalDescription(offer)
     request = {'record': record, 'bitrate': bitrate}
     request.update(media)
     response = await plugin.sendMessage(
@@ -290,6 +324,10 @@ if __name__ == '__main__':
     parser.add_argument('--play-from',
                         help='Read the media from a file and sent it.'),
     parser.add_argument('--verbose', '-v', action='count')
+    parser.add_argument('--stun', default='stun.l.google.com:19302', help='STUN server host:port (default: stun.l.google.com:19302)')
+    parser.add_argument('--no-stun', action='store_true', help='Disable STUN (use local host candidates only)')
+    parser.add_argument('--local-ip', help='Force local host candidates to this exact IP')
+    parser.add_argument('--local-ip-prefix', help='Force local host candidates to this IP prefix, e.g., 192.168.')
     args = parser.parse_args()
 
     if args.verbose:
@@ -299,7 +337,8 @@ if __name__ == '__main__':
 
     # create signaling and peer connection
     session = JanusSession(args.url)
-    pc = RTCPeerConnection()
+    cfg = None if args.no_stun else RTCConfiguration(iceServers=[RTCIceServer(f'stun:{args.stun}')])
+    pc = RTCPeerConnection(cfg) if cfg else RTCPeerConnection()
 
     # create media source
     if args.play_from:
@@ -311,7 +350,7 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
-            run(pc=pc, player=player, session=session)
+            run(pc=pc, player=player, session=session, allow_ip=args.local_ip, allow_prefix=args.local_ip_prefix)
         )
         logger.info('Test Passed')
         sys.exit(0)

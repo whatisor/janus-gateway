@@ -985,6 +985,78 @@ AM_CONDITIONAL([WITH_SOURCE_DATE_EPOCH], [test "x$SOURCE_DATE_EPOCH" != "x"])
 AM_CONDITIONAL([ENABLE_POST_PROCESSING], [test "x$enable_post_processing" = "xyes"])
 AM_CONDITIONAL([ENABLE_PCAP2MJR], [test "x$enable_pcap2mjr" = "xyes"])
 
+AC_ARG_ENABLE([abmod-aws-sdk],
+              [AS_HELP_STRING([--enable-abmod-aws-sdk],
+                              [Link AWS SDK for C++ for per-user abmod AWS Transcribe (libaws-cpp-sdk-transcribestreaming + optional libaws-cpp-sdk-transcribe for custom vocabulary)])],
+              [],
+              [enable_abmod_aws_sdk=no])
+
+AC_SUBST([ABMOD_AWS_SDK_CPPFLAGS], [""])
+AC_SUBST([ABMOD_AWS_SDK_LDFLAGS], [""])
+AC_SUBST([ABMOD_AWS_SDK_LIBS], [""])
+
+AS_IF([test "x$enable_abmod_aws_sdk" = "xyes"],
+      [
+       AC_PROG_CXX
+       AC_ARG_WITH([aws-sdk-cpp],
+                   [AS_HELP_STRING([--with-aws-sdk-cpp=DIR],
+                                   [Install prefix for AWS SDK for C++ (include/ and lib/). Default: /usr/local when --enable-abmod-aws-sdk is used.])],
+                   [AWS_SDK_CPP_PREFIX=$withval],
+                   [AWS_SDK_CPP_PREFIX=])
+       dnl Treat --without-aws-sdk-cpp like an unspecified prefix (use default below).
+       AS_IF([test "x$AWS_SDK_CPP_PREFIX" = "xno"], [AWS_SDK_CPP_PREFIX=])
+       dnl Without a prefix, ABMOD_AWS_SDK_CPPFLAGS stays empty and the C++ compile cannot find
+       dnl <aws/transcribestreaming/...> (typical when Docker enables abmod but omits --with-aws-sdk-cpp).
+       AS_IF([test -z "$AWS_SDK_CPP_PREFIX"], [AWS_SDK_CPP_PREFIX=/usr/local])
+       ABMOD_AWS_SDK_CPPFLAGS="-I$AWS_SDK_CPP_PREFIX/include"
+       ABMOD_AWS_SDK_LDFLAGS="-L$AWS_SDK_CPP_PREFIX/lib"
+       ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-core"
+       dnl Check for optional non-streaming transcribe SDK (custom vocabulary creation).
+       dnl Both SDKs share the same install prefix so ABMOD_AWS_SDK_CPPFLAGS already covers it.
+       save_CPPFLAGS="$CPPFLAGS"
+       CPPFLAGS="$CPPFLAGS $ABMOD_AWS_SDK_CPPFLAGS"
+       AC_LANG_PUSH([C++])
+       AC_CHECK_HEADER([aws/transcribe/TranscribeServiceClient.h],
+           [AC_DEFINE([HAVE_AWS_TRANSCRIBE_SDK], [1],
+               [Define to 1 if aws-cpp-sdk-transcribe headers are present (enables custom vocabulary creation)])
+            ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-transcribe -laws-cpp-sdk-core"],
+           [AC_MSG_WARN([aws-cpp-sdk-transcribe headers not found — custom vocabulary creation disabled.
+  Rebuild the AWS SDK with -DBUILD_ONLY="core;transcribestreaming;transcribe" to enable it.])])
+       AC_LANG_POP([C++])
+       CPPFLAGS="$save_CPPFLAGS"
+      ])
+
+AM_CONDITIONAL([ENABLE_ABMOD_AWS_SDK], [test "x$enable_abmod_aws_sdk" = "xyes"])
+
+dnl ── ONNX Runtime for abmod embedding (all-MiniLM-L6-v2 selectBest) ──────────
+AC_SUBST([ABMOD_ONNXRT_CPPFLAGS], [""])
+AC_SUBST([ABMOD_ONNXRT_LIBS], [""])
+
+AC_ARG_WITH([onnxruntime],
+            [AS_HELP_STRING([--with-onnxruntime=DIR],
+                            [Install prefix for ONNX Runtime C++ (include/ and lib/). Default: /usr/local. Use --without-onnxruntime to disable embedding.])],
+            [ONNXRUNTIME_PREFIX=$withval],
+            [ONNXRUNTIME_PREFIX=/usr/local])
+
+AS_IF([test "x$ONNXRUNTIME_PREFIX" != "xno"],
+      [
+       AC_PROG_CXX
+       ABMOD_ONNXRT_CPPFLAGS="-I$ONNXRUNTIME_PREFIX/include"
+       ABMOD_ONNXRT_LIBS="-L$ONNXRUNTIME_PREFIX/lib -lonnxruntime"
+       enable_abmod_embedding=yes
+      ],
+      [enable_abmod_embedding=no])
+
+dnl Model directory — where 'make download-models' installs and the provider looks by default.
+AC_ARG_WITH([embedding-model-dir],
+            [AS_HELP_STRING([--with-embedding-model-dir=DIR],
+                            [Directory for all-MiniLM-L6-v2 ONNX model files. Default: DATADIR/janus/models/all-MiniLM-L6-v2])],
+            [ABMOD_EMBEDDING_MODEL_DIR=$withval],
+            [ABMOD_EMBEDDING_MODEL_DIR='$(datadir)/janus/models/all-MiniLM-L6-v2'])
+AC_SUBST([ABMOD_EMBEDDING_MODEL_DIR])
+
+AM_CONDITIONAL([ENABLE_ABMOD_EMBEDDING], [test "x$enable_abmod_embedding" = "xyes"])
+
 AC_CONFIG_FILES([
   Makefile
   src/Makefile
@@ -1068,6 +1140,12 @@ AM_COND_IF([ENABLE_PLUGIN_NOSIP],
 AM_COND_IF([ENABLE_PLUGIN_AUDIOBRIDGE],
 	[echo "    Audio Bridge:          yes"],
 	[echo "    Audio Bridge:          no"])
+AM_COND_IF([ENABLE_ABMOD_AWS_SDK],
+	[echo "    ABMod AWS SDK (C++):   yes (prefix: $[]AWS_SDK_CPP_PREFIX)"],
+	[echo "    ABMod AWS SDK (C++):   no (stub; use --enable-abmod-aws-sdk)"])
+AM_COND_IF([ENABLE_ABMOD_EMBEDDING],
+	[echo "    ABMod Embedding (ORT): yes (prefix: $[]ONNXRUNTIME_PREFIX, models: $[]ABMOD_EMBEDDING_MODEL_DIR)"],
+	[echo "    ABMod Embedding (ORT): no  (use --with-onnxruntime to enable)"])
 AM_COND_IF([ENABLE_PLUGIN_VIDEOROOM],
 	[echo "    Video Room:            yes"],
 	[echo "    Video Room:            no"])
