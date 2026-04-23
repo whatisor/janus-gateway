@@ -109,6 +109,13 @@ function sttNormalizeAbmod(msg) {
 
 // ─── ABMod config ────────────────────────────────────────────────────────────
 
+function generateUUID() {
+	return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+		var r = Math.random() * 16 | 0;
+		return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+	});
+}
+
 function buildAbmodConfig() {
 	var provider = $('#sttProvider').val() || 'aws';
 	if(provider === 'openai') {
@@ -122,16 +129,20 @@ function buildAbmodConfig() {
 		if($('#openaiFastMode').is(':checked')) cfg.openai_fast_mode = true;
 		return cfg;
 	}
-	return {
+	var awsCfg = {
 		provider: 'aws',
 		aws_language_code: 'en-US',
 		aws_region: 'us-east-1',
 		aws_specialty: 'PRIMARYCARE',
 		aws_stream_type: 'CONVERSATION',
-		aws_session_id_prefix: 'ab-',
-		aws_medical_redaction: true,
-		aws_fast_mode: $('#awsFastMode').is(':checked')
+		aws_session_id: generateUUID(),
+		aws_medical_redaction: false,
+		aws_fast_mode: $('#awsFastMode').is(':checked'),
+		aws_vocabulary_name:'test'
 	};
+	var vocabPrompt = $('#awsVocabPrompt').val().trim();
+	if(vocabPrompt) awsCfg.aws_vocabulary_prompt = vocabPrompt;
+	return awsCfg;
 }
 
 // ─── Room bootstrap ───────────────────────────────────────────────────────────

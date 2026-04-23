@@ -984,7 +984,7 @@ AM_CONDITIONAL([ENABLE_PCAP2MJR], [test "x$enable_pcap2mjr" = "xyes"])
 
 AC_ARG_ENABLE([abmod-aws-sdk],
               [AS_HELP_STRING([--enable-abmod-aws-sdk],
-                              [Link AWS SDK for C++ for per-user abmod AWS Transcribe (libaws-cpp-sdk-transcribestreaming)])],
+                              [Link AWS SDK for C++ for per-user abmod AWS Transcribe (libaws-cpp-sdk-transcribestreaming + optional libaws-cpp-sdk-transcribe for custom vocabulary)])],
               [],
               [enable_abmod_aws_sdk=no])
 
@@ -1008,6 +1008,19 @@ AS_IF([test "x$enable_abmod_aws_sdk" = "xyes"],
        ABMOD_AWS_SDK_CPPFLAGS="-I$AWS_SDK_CPP_PREFIX/include"
        ABMOD_AWS_SDK_LDFLAGS="-L$AWS_SDK_CPP_PREFIX/lib"
        ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-core"
+       dnl Check for optional non-streaming transcribe SDK (custom vocabulary creation).
+       dnl Both SDKs share the same install prefix so ABMOD_AWS_SDK_CPPFLAGS already covers it.
+       save_CPPFLAGS="$CPPFLAGS"
+       CPPFLAGS="$CPPFLAGS $ABMOD_AWS_SDK_CPPFLAGS"
+       AC_LANG_PUSH([C++])
+       AC_CHECK_HEADER([aws/transcribe/TranscribeServiceClient.h],
+           [AC_DEFINE([HAVE_AWS_TRANSCRIBE_SDK], [1],
+               [Define to 1 if aws-cpp-sdk-transcribe headers are present (enables custom vocabulary creation)])
+            ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-transcribe -laws-cpp-sdk-core"],
+           [AC_MSG_WARN([aws-cpp-sdk-transcribe headers not found — custom vocabulary creation disabled.
+  Rebuild the AWS SDK with -DBUILD_ONLY="core;transcribestreaming;transcribe" to enable it.])])
+       AC_LANG_POP([C++])
+       CPPFLAGS="$save_CPPFLAGS"
       ])
 
 AM_CONDITIONAL([ENABLE_ABMOD_AWS_SDK], [test "x$enable_abmod_aws_sdk" = "xyes"])

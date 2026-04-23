@@ -107,7 +107,7 @@ Supported keys:
 - `aws_region` (default `us-east-1`)
 - `aws_specialty` (default `PRIMARYCARE`; the SDK layer currently hardcodes `PRIMARYCARE` regardless of this value — extend `parse_specialty()` in `abmod_provider_aws_sdk.cpp` to support other values)
 - `aws_stream_type` (default `CONVERSATION`; or `DICTATION`)
-- `aws_session_id_prefix` (default empty string; final session id is `<prefix><room_id>-<user_id>`)
+- `aws_session_id` (default empty string; final session id is `<prefix><room_id>-<user_id>`)
 - `aws_medical_redaction` (default `false`)
 - `aws_access_key_id` (optional override; prefer environment variable)
 - `aws_secret_access_key` (optional override; prefer environment variable)
@@ -124,7 +124,7 @@ Example:
   "aws_region": "us-east-1",
   "aws_specialty": "PRIMARYCARE",
   "aws_stream_type": "CONVERSATION",
-  "aws_session_id_prefix": "prod-",
+  "aws_session_id": "prod-",
   "aws_medical_redaction": false
 }
 ```

@@ -17,6 +17,8 @@ typedef struct AbmodAwsNativeConfig {
 	uint32_t sample_rate;
 	int medical_redaction;
 	int fast_mode; /* 1=emit partial+final, 0=emit final only */
+	const char *vocabulary_name;   /* optional: pre-created AWS custom medical vocabulary */
+	const char *vocabulary_prompt; /* optional: comma-separated terms → vocabulary created live per session */
 	const char *access_key_id;
 	const char *secret_access_key;
 	const char *session_token;
@@ -54,6 +56,22 @@ int abmod_aws_native_stream_send_pcm(void *stream,
 		int channels);
 
 void abmod_aws_native_stream_close(void *stream);
+
+/* Create a temporary vocabulary from comma-separated prompt phrases.
+ * Generates a unique name, polls until READY (up to max_wait_seconds),
+ * writes the name into out_name (caller-supplied buffer of out_name_len bytes).
+ * cancel: if non-NULL, checked every poll step — set to non-zero to abort early.
+ * Returns 0 on success, -1 on failure or cancellation. */
+int abmod_aws_native_create_vocabulary_from_prompt(const AbmodAwsNativeConfig *cfg,
+		const char *prompt,
+		char *out_name,
+		size_t out_name_len,
+		int max_wait_seconds,
+		volatile int *cancel);
+
+/* Delete a vocabulary by name. No-op if vocab_name is NULL or empty. */
+void abmod_aws_native_delete_vocabulary(const AbmodAwsNativeConfig *cfg,
+		const char *vocab_name);
 
 #ifdef __cplusplus
 } /* extern "C" */
