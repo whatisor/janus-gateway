@@ -9926,16 +9926,16 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 				janus_audiobridge_notify_participants(audiobridge, participant, event, TRUE);
 				json_decref(event);
 				/* Also notify custom module */
-        if(participant->room->abmod_ctx && participant->room->abmod_on_event) {
-            const char *ev = participant->talking ? "talking" : "stopped-talking";
-            participant->room->talk_version++;
-            participant->room->abmod_on_event(participant->room->abmod_ctx,
-                ev,
-                participant->room->room_id_str,
-                participant->user_id_str,
-                janus_get_monotonic_time(),
-                participant->room->talk_version);
-        }
+				if(participant->room->abmod_ctx && participant->room->abmod_on_event) {
+					const char *ev = participant->talking ? "talking" : "stopped-talking";
+					participant->room->talk_version++;
+					participant->room->abmod_on_event(participant->room->abmod_ctx,
+						ev,
+						participant->room->room_id_str,
+						participant->user_id_str,
+						janus_get_monotonic_time(),
+						participant->room->talk_version);
+				}
 				janus_mutex_unlock(&participant->room->mutex);
 				/* Also notify event handlers */
 				if(notify_events && gateway->events_is_enabled()) {
@@ -9947,7 +9947,6 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 						string_ids ? json_string(participant->user_id_str) : json_integer(participant->user_id));
 					gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
 				}
-				janus_mutex_unlock(&audiobridge->mutex);
 			}
 		}
 	}
