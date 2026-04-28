@@ -81,6 +81,9 @@ typedef struct abmod_ctx_s {
 	abmod_provider *provider;
 } abmod_ctx;
 
+/* Internal queue helper used by callbacks declared later in the file. */
+static int abmod_enqueue_locked(abmod_ctx *ctx, const abmod_qitem *src);
+
 static void abmod_emit(abmod_ctx *ctx, const char *event_name, json_t *payload) {
 	if(!ctx || !ctx->cbs.emit_event || !event_name || !payload)
 		return;
@@ -110,6 +113,19 @@ static int abmod_is_auth_error(const char *message) {
 		strstr(lower, "401") != NULL;
 	g_free(lower);
 	return is_auth;
+}
+
+static int abmod_is_idle_timeout_error(const char *message) {
+	if(!message || !*message)
+		return 0;
+	char *lower = g_ascii_strdown(message, -1);
+	if(!lower)
+		return 0;
+	int is_timeout =
+		strstr(lower, "timed out because no new audio was received") != NULL ||
+		strstr(lower, "no new audio was received") != NULL;
+	g_free(lower);
+	return is_timeout;
 }
 
 static void abmod_on_transcript(void *user,
@@ -167,6 +183,20 @@ static void abmod_on_error(void *user,
 	json_object_set_new(payload, "ts_us", json_integer((json_int_t)g_get_real_time()));
 	abmod_emit(ctx, "error", payload);
 	json_decref(payload);
+
+	/* On AWS idle-timeout,
+	 * stream and active_streams bookkeeping stay in sync. */
+	if(room_id && *room_id && user_id && *user_id && abmod_is_idle_timeout_error(err)) {
+		abmod_qitem item;
+		memset(&item, 0, sizeof(item));
+		item.type = ABMOD_ITEM_EVENT;
+		snprintf(item.event_name, sizeof(item.event_name), "%s", "idle_timeout");
+		snprintf(item.room_id, sizeof(item.room_id), "%s", room_id);
+		snprintf(item.user_id, sizeof(item.user_id), "%s", user_id);
+		pthread_mutex_lock(&ctx->lock);
+		abmod_enqueue_locked(ctx, &item);
+		pthread_mutex_unlock(&ctx->lock);
+	}
 }
 
 static char *abmod_stream_key(const char *room_id, const char *user_id) {
@@ -273,7 +303,8 @@ static void *abmod_worker(void *arg) {
 			if(strcmp(item.event_name, "talking") == 0 || strcmp(item.event_name, "unmuted") == 0)
 				abmod_ensure_stream_locked(ctx, item.room_id, item.user_id,
 					ctx->rate, ctx->channels);
-			else if(strcmp(item.event_name, "muted") == 0 || strcmp(item.event_name, "left") == 0)
+			else if(strcmp(item.event_name, "muted") == 0
+				|| strcmp(item.event_name, "left") == 0 || strcmp(item.event_name, "idle_timeout") == 0)
 				abmod_close_stream_locked(ctx, item.room_id, item.user_id);
 		} else if(item.type == ABMOD_ITEM_PCM_USER || item.type == ABMOD_ITEM_PCM_MIX) {
 			if(abmod_ensure_stream_locked(ctx, item.room_id, item.user_id, item.sampling_rate, item.channels) == 0)
@@ -439,7 +470,8 @@ void abmod_on_event(void *vctx, const char *event_name,
 
 	ABMOD_LOG("event '%s' room=%s user=%s", event_name, room_id, user_id);
 	if(strcmp(event_name, "talking") == 0 || strcmp(event_name, "unmuted") == 0 ||
-			strcmp(event_name, "muted") == 0 || strcmp(event_name, "left") == 0) {
+			strcmp(event_name, "muted") == 0 || strcmp(event_name, "left") == 0 ||
+			strcmp(event_name, "stopped-talking") == 0) {
 		abmod_qitem item;
 		memset(&item, 0, sizeof(item));
 		item.type = ABMOD_ITEM_EVENT;
@@ -479,11 +511,6 @@ void abmod_on_participant_pcm(void *vctx,
 	/* enable_mix uses mixed PCM path only; skip per-user streaming */
 	if(ctx->enable_mix)
 		return;
-
-	/* Throttled log: print once every 500 frames (~10 s at 20 ms/frame) */
-	static volatile int pcm_log_counter = 0;
-	if(__atomic_add_fetch(&pcm_log_counter, 1, __ATOMIC_RELAXED) % 500 == 1)
-		ABMOD_LOG("pcm room=%s user=%s samples=%zu rate=%u", room_id, user_id, samples, sampling_rate);
 
 	int16_t *pcm_copy = (int16_t *)malloc(samples * sizeof(int16_t));
 	if(!pcm_copy)

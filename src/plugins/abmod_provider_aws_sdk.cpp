@@ -102,7 +102,18 @@ static LanguageCode parse_language(const char *lc) {
 }
 
 static Specialty parse_specialty(const char *sp) {
-	(void)sp;
+	if(!sp || !*sp)
+		return Specialty::PRIMARYCARE;
+	if(ABMOD_STRICMP(sp, "CARDIOLOGY") == 0)
+		return Specialty::CARDIOLOGY;
+	if(ABMOD_STRICMP(sp, "NEUROLOGY") == 0)
+		return Specialty::NEUROLOGY;
+	if(ABMOD_STRICMP(sp, "ONCOLOGY") == 0)
+		return Specialty::ONCOLOGY;
+	if(ABMOD_STRICMP(sp, "UROLOGY") == 0)
+		return Specialty::UROLOGY;
+	if(ABMOD_STRICMP(sp, "PRIMARYCARE") == 0)
+		return Specialty::PRIMARYCARE;
 	return Specialty::PRIMARYCARE;
 }
 
@@ -145,6 +156,9 @@ struct NativeStream {
 	uint32_t cfg_sample_rate{16000};
 	int cfg_medical_redaction{0};
 	bool cfg_fast_mode{true};
+
+	int pcm_log_counter{0};
+	Utils::Threading::Semaphore done{0, 1};
 
 	std::shared_ptr<TranscribeStreamingServiceClient> client;
 	std::thread worker;
@@ -200,6 +214,95 @@ struct NativeStream {
 		cv.notify_one();
 	}
 
+	void on_stream_ready(AudioStream &stream) {
+		int64_t hb_last_us = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		size_t hb_chunks = 0;
+		size_t hb_bytes = 0;
+		for(;;) {
+			std::vector<uint8_t> chunk;
+			bool is_closing = false;
+			{
+				std::unique_lock<std::mutex> lk(mu);
+				cv.wait(lk, [this] {
+					return stop || !q.empty();
+				});
+				is_closing = closing;
+				if(stop && q.empty()) {
+					/* Empty AudioEvent ends the stream per AWS bidirectional event spec */
+					if(!stream.WriteAudioEvent(AudioEvent())) {
+						if(!is_closing)
+							emit_err("WriteAudioEvent(empty) failed");
+						return;
+					}
+					stream.flush();
+					/* Explicit close avoids 15s AWS idle timeout on unload. */
+					stream.Close();
+					return;
+				}
+				if(!q.empty()) {
+					chunk = std::move(q.front());
+					q.pop();
+				}
+			}
+			if(!chunk.empty()) {
+				Aws::Vector<unsigned char> bits(chunk.begin(), chunk.end());
+				AudioEvent aev(std::move(bits));
+				if(!stream.WriteAudioEvent(aev)) {
+					/* Mark stream as broken so push_pcm stops accepting data */
+					{
+						std::lock_guard<std::mutex> lk(mu);
+						stream_error = true;
+						/* Drain queue to free memory */
+						while(!q.empty()) q.pop();
+					}
+					/* Include chunk size for diagnosis (credentials/network issues
+					 * often manifest as immediate write failures on the first chunk) */
+					char errmsg[128];
+					snprintf(errmsg, sizeof(errmsg),
+						"WriteAudioEvent failed (chunk=%zu bytes) — check AWS credentials and region",
+						chunk.size());
+					emit_err(errmsg);
+					return;
+				}
+				hb_chunks++;
+				hb_bytes += chunk.size();
+				int64_t hb_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count();
+				if(hb_now_us - hb_last_us >= 10000000LL) {
+					hb_last_us = hb_now_us;
+					ABMOD_LOG("heartbeat room=%s user=%s sent_chunks=%zu sent_bytes=%zu",
+						room_id, user_id, hb_chunks, hb_bytes);
+				}
+			}
+		}
+	}
+
+	void on_response(const TranscribeStreamingServiceClient *,
+			const StartMedicalStreamTranscriptionRequest &,
+			const StartMedicalStreamTranscriptionOutcome &outcome,
+			const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
+		if(!outcome.IsSuccess()) {
+			const Aws::String msg = outcome.GetError().GetMessage();
+			bool is_closing = false;
+			{
+				std::lock_guard<std::mutex> lk(mu);
+				is_closing = closing;
+			}
+			if(is_closing) {
+				const std::string s = msg.c_str();
+				const bool benign_shutdown_error =
+					s.find("A complete signal was sent without the preceding empty frame") != std::string::npos ||
+					s.find("timed out because no new audio was received") != std::string::npos;
+				if(!benign_shutdown_error)
+					emit_err(msg.c_str());
+			} else {
+				emit_err(msg.c_str());
+			}
+		}
+		done.Release();
+	}
+
 	void run_async() {
 		ClientConfiguration client_cfg;
 		client_cfg.region = cfg_region;
@@ -253,8 +356,6 @@ struct NativeStream {
 		request.SetMediaEncoding(MediaEncoding::pcm);
 		request.SetSpecialty(parse_specialty(cfg_specialty.c_str()));
 		request.SetType(parse_type(cfg_stream_type.c_str()));
-		if(!cfg_session_id.empty())
-		 	request.SetSessionId(Aws::String(cfg_session_id));
 		if(cfg_medical_redaction)
 			request.SetContentIdentificationType(MedicalContentIdentificationType::PHI);
 
@@ -263,86 +364,14 @@ struct NativeStream {
 
 		request.SetEventStreamHandler(handler);
 
-		Utils::Threading::Semaphore done(0, 1);
-
-		auto on_stream_ready = [this](AudioStream &stream) {
-			for(;;) {
-				std::vector<uint8_t> chunk;
-				bool is_closing = false;
-				{
-					std::unique_lock<std::mutex> lk(mu);
-					cv.wait(lk, [this] {
-						return stop || !q.empty();
-					});
-					is_closing = closing;
-					if(stop && q.empty()) {
-						/* Empty AudioEvent ends the stream per AWS bidirectional event spec */
-						if(!stream.WriteAudioEvent(AudioEvent())) {
-							if(!is_closing)
-								emit_err("WriteAudioEvent(empty) failed");
-							return;
-						}
-						stream.flush();
-						/* Explicit close avoids 15s AWS idle timeout on unload. */
-						stream.Close();
-						return;
-					}
-					if(!q.empty()) {
-						chunk = std::move(q.front());
-						q.pop();
-					}
-				}
-			if(!chunk.empty()) {
-				Aws::Vector<unsigned char> bits(chunk.begin(), chunk.end());
-				AudioEvent aev(std::move(bits));
-				if(!stream.WriteAudioEvent(aev)) {
-					/* Mark stream as broken so push_pcm stops accepting data */
-					{
-						std::lock_guard<std::mutex> lk(mu);
-						stream_error = true;
-						/* Drain queue to free memory */
-						while(!q.empty()) q.pop();
-					}
-					/* Include chunk size for diagnosis (credentials/network issues
-					 * often manifest as immediate write failures on the first chunk) */
-					char errmsg[128];
-					snprintf(errmsg, sizeof(errmsg),
-						"WriteAudioEvent failed (chunk=%zu bytes) — check AWS credentials and region",
-						chunk.size());
-					emit_err(errmsg);
-					return;
-				}
-			}
-			}
-		};
-
-		auto on_response = [this, &done](
-				const TranscribeStreamingServiceClient *,
-				const StartMedicalStreamTranscriptionRequest &,
-				const StartMedicalStreamTranscriptionOutcome &outcome,
-				const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
-			if(!outcome.IsSuccess()) {
-				const Aws::String msg = outcome.GetError().GetMessage();
-				bool is_closing = false;
-				{
-					std::lock_guard<std::mutex> lk(mu);
-					is_closing = closing;
-				}
-				if(is_closing) {
-					const std::string s = msg.c_str();
-					const bool benign_shutdown_error =
-						s.find("A complete signal was sent without the preceding empty frame") != std::string::npos ||
-						s.find("timed out because no new audio was received") != std::string::npos;
-					if(!benign_shutdown_error)
-						emit_err(msg.c_str());
-				} else {
-					emit_err(msg.c_str());
-				}
-			}
-			done.Release();
-		};
-
-		client->StartMedicalStreamTranscriptionAsync(request, on_stream_ready, on_response, nullptr);
+		client->StartMedicalStreamTranscriptionAsync(request,
+			[this](AudioStream &s){ on_stream_ready(s); },
+			[this](const TranscribeStreamingServiceClient *client_ptr,
+					const StartMedicalStreamTranscriptionRequest &req,
+					const StartMedicalStreamTranscriptionOutcome &outcome,
+					const std::shared_ptr<const Aws::Client::AsyncCallerContext> &ctx) {
+				on_response(client_ptr, req, outcome, ctx);
+			}, nullptr);
 		done.WaitOne();
 	}
 };
@@ -458,6 +487,8 @@ int abmod_aws_native_stream_send_pcm(void *stream,
 	auto *s = static_cast<NativeStream *>(stream);
 	if(!s || !pcm || samples == 0)
 		return -1;
+	if(s->pcm_log_counter++ % 500 == 1)
+		ABMOD_LOG("pcm room=%s user=%s samples=%zu rate=%u", s->room_id, s->user_id, samples, s->cfg_sample_rate);
 	s->push_pcm(pcm, samples, channels);
 	return 0;
 }

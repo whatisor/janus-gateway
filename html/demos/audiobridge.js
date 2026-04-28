@@ -14,6 +14,7 @@ var ABMOD_SO_PATH = '/var/janus/janus/lib/janus/abmodules/libabmod_transcriber_t
 // STT display state
 var sttPartialItems = {};
 var sttKnownUsers  = {};
+var sttTalkingUsers = {};
 
 // ─── STT helpers ────────────────────────────────────────────────────────────
 
@@ -33,6 +34,37 @@ function sttResolveMultiple(u) {
 	if(String(u).includes(','))
 		return String(u).split(',').map(x => sttResolveName(x.trim()) || x.trim()).join(', ');
 	return sttResolveName(u);
+}
+
+function sttResolveId(raw) {
+	if(raw === undefined || raw === null) return null;
+	return String(raw);
+}
+
+function sttSetActivityStatus(text) {
+	var el = $('#talkingStatus');
+	if(!el.length) el = $('#sttStatus');
+	if(el.length) el.text(text || 'idle');
+}
+
+function sttSetParticipantTalking(userId, display, isTalking) {
+	var id = sttResolveId(userId);
+	if(!id) return;
+	if(display) sttRememberUser(id, display);
+	if(isTalking) sttTalkingUsers[id] = true;
+	else delete sttTalkingUsers[id];
+	var row = $('#rp' + id);
+	if(row.length) {
+		row.toggleClass('list-group-item-success', !!isTalking);
+		row.find('.rp-talking').toggleClass('d-none', !isTalking);
+	}
+	var names = Object.keys(sttTalkingUsers).map(function(uid) {
+		return sttResolveName(uid) || uid;
+	});
+	if(names.length > 0)
+		sttSetActivityStatus('talking: ' + names.join(', '));
+	else
+		sttSetActivityStatus('idle');
 }
 
 function escapeHtml(v) {
@@ -153,14 +185,23 @@ function doJoin() {
 	});
 }
 
-function createRoomThenJoin() {
+function createRoomThenJoin(options) {
+	options = options || {};
 	audiobridgeHandle.send({
 		message: {
 			request: 'create',
 			room: myroom,
 			description: 'AudioBridge room ' + myroom,
 			is_private: false,
-			sampling_rate: 16000,
+			denoise: options.denoise !== undefined ? options.denoise : false,
+			audiolevel_ext: options.audiolevel_ext !== undefined ? options.audiolevel_ext : true,
+			audiolevel_event: options.audiolevel_event !== undefined ? options.audiolevel_event : true,
+			audio_active_packets: options.audio_active_packets || 20,
+			audio_level_average: options.audio_level_average || 35,
+			sampling_rate: options.sampling_rate,
+			secret: options.secret,
+			use_limiter: options.use_limiter !== undefined ? !!options.use_limiter : true,
+			volume: options.volume ?? 90,
 			permanent: false
 		},
 		success: function(result) {
@@ -229,12 +270,20 @@ function handleMessage(msg, jsep) {
 					addParticipant(p['id'], p['display'], p['muted']);
 				else
 					$('#rp' + p['id'] + ' i').toggleClass('fa-microphone', !p['muted']).toggleClass('fa-microphone-slash', !!p['muted']);
+				if(p['talking'] !== undefined)
+					sttSetParticipantTalking(p['id'], p['display'], !!p['talking']);
 			});
 		}
 		var leaving = msg['leaving'];
-		if(leaving) removeParticipant(leaving);
+		if(leaving) {
+			sttSetParticipantTalking(leaving, null, false);
+			removeParticipant(leaving);
+		}
 		var kicked = msg['kicked'];
-		if(kicked) removeParticipant(kicked);
+		if(kicked) {
+			sttSetParticipantTalking(kicked, null, false);
+			removeParticipant(kicked);
+		}
 		var error = msg['error'];
 		var errorCode = Number(msg['error_code']);
 		if(error) {
@@ -249,6 +298,13 @@ function handleMessage(msg, jsep) {
 		}
 		// Mute toggle confirmation
 		if(msg['result'] && msg['result'] === 'ok') { /* configure ack */ }
+	}
+
+	if(event === 'talking' || event === 'stopped-talking') {
+		var speaking = event === 'talking';
+		var talkId = msg['id'] !== undefined ? msg['id'] : (msg['user_id'] !== undefined ? msg['user_id'] : msg['user']);
+		var talkDisplay = msg['display'];
+		sttSetParticipantTalking(talkId, talkDisplay, speaking);
 	}
 
 	// ABMod transcription events
@@ -296,7 +352,8 @@ function addParticipant(id, display, muted) {
 	if($('#rp' + id).length > 0) return;
 	var icon = muted ? 'fa-microphone-slash' : 'fa-microphone';
 	var li = $('<li id="rp' + id + '" class="list-group-item">' +
-		'<i class="fa-solid ' + icon + ' me-2"></i>' + escapeHtml(display || id) + '</li>');
+		'<i class="fa-solid ' + icon + ' me-2"></i>' + escapeHtml(display || id) +
+		'<span class="badge text-bg-success float-end rp-talking d-none">talking</span></li>');
 	$('#list').append(li);
 }
 
