@@ -1,5 +1,8 @@
 /* Stub when Janus is built without --enable-abmod-aws-sdk (no AWS C++ SDK linked). */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "abmod_provider_aws_sdk.h"
 
 void abmod_aws_native_global_init(void) {}
@@ -34,4 +37,21 @@ int abmod_aws_native_stream_send_pcm(void *stream,
 
 void abmod_aws_native_stream_close(void *stream) {
 	(void)stream;
+}
+
+int abmod_aws_native_translate_text_dup(const AbmodAwsNativeConfig *cfg,
+		const char *source_language_code,
+		const char *target_language_code,
+		const char *text,
+		char **out_text,
+		char **out_error) {
+	(void)cfg;
+	(void)source_language_code;
+	(void)target_language_code;
+	(void)text;
+	if(out_text)
+		*out_text = NULL;
+	if(out_error)
+		*out_error = strdup("AWS SDK not enabled (build with --enable-abmod-aws-sdk)");
+	return -1;
 }

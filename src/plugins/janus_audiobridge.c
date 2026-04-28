@@ -7460,6 +7460,29 @@ static void *janus_audiobridge_handler(void *data) {
 					janus_mutex_unlock(&audiobridge->mutex);
 				}
 				janus_mutex_unlock(&rooms_mutex);
+			} else if(abmod_config && json_is_string(abmod_config)) {
+				const char *cfg = json_string_value(abmod_config);
+				janus_mutex_lock(&rooms_mutex);
+				janus_audiobridge_room *audiobridge = participant->room;
+				if(audiobridge) {
+					janus_mutex_lock(&audiobridge->mutex);
+					g_free(audiobridge->abmod_config);
+					audiobridge->abmod_config = cfg ? g_strdup(cfg) : NULL;
+					if(audiobridge->abmod_ctx && audiobridge->abmod_on_event && cfg && *cfg) {
+						audiobridge->talk_version++;
+						audiobridge->abmod_on_event(audiobridge->abmod_ctx,
+							cfg,
+							audiobridge->room_id_str,
+							participant->user_id_str,
+							janus_get_monotonic_time(),
+							audiobridge->talk_version);
+						JANUS_LOG(LOG_INFO, "[AudioBridge] forwarded abmod_config to active module\n");
+					} else {
+						JANUS_LOG(LOG_WARN, "[AudioBridge] abmod_config updated but no active module context/event callback to apply it to\n");
+					}
+					janus_mutex_unlock(&audiobridge->mutex);
+				}
+				janus_mutex_unlock(&rooms_mutex);
 			}
 			if(rtp != NULL) {
 				JANUS_VALIDATE_JSON_OBJECT(root, rtp_parameters,

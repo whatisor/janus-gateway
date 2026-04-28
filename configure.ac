@@ -1022,6 +1022,12 @@ AS_IF([test "x$enable_abmod_aws_sdk" = "xyes"],
             ABMOD_AWS_SDK_LIBS="-laws-cpp-sdk-transcribestreaming -laws-cpp-sdk-transcribe -laws-cpp-sdk-core"],
            [AC_MSG_WARN([aws-cpp-sdk-transcribe headers not found — custom vocabulary creation disabled.
   Rebuild the AWS SDK with -DBUILD_ONLY="core;transcribestreaming;transcribe" to enable it.])])
+         AC_CHECK_HEADER([aws/translate/TranslateClient.h],
+               [AC_DEFINE([HAVE_AWS_TRANSLATE_SDK], [1],
+                     [Define to 1 if aws-cpp-sdk-translate headers are present (enables AWS text translation in ABMod)])
+                  ABMOD_AWS_SDK_LIBS="$ABMOD_AWS_SDK_LIBS -laws-cpp-sdk-translate"],
+               [AC_MSG_WARN([aws-cpp-sdk-translate headers not found — ABMod translation helper disabled.
+  Rebuild the AWS SDK with -DBUILD_ONLY="core;transcribestreaming;translate" to enable it.])])
        AC_LANG_POP([C++])
        CPPFLAGS="$save_CPPFLAGS"
       ])

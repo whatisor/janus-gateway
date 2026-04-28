@@ -8,6 +8,7 @@ var myroom = 1234;
 var myusername = null;
 var myid = null;
 var webrtcUp = false;
+var sttAbmodLoaded = false;
 
 var ABMOD_SO_PATH = '/var/janus/janus/lib/janus/abmodules/libabmod_transcriber_template.so';
 
@@ -116,13 +117,60 @@ function generateUUID() {
 	});
 }
 
+function getSelectedOutputLanguage() {
+	var selected = ($('#sttOutputLanguage').val() || '').trim();
+	return selected || 'en-US';
+}
+
+function ensureOutputLanguageControl() {
+	if($('#sttOutputLanguage').length > 0)
+		return;
+	var row = $('#room .row.mb-2 .d-flex.align-items-center.gap-2.flex-wrap').first();
+	if(row.length === 0)
+		return;
+	var wrap = $('<div class="input-group input-group-sm" style="width:auto" title="Transcript output language"></div>');
+	wrap.append('<span class="input-group-text">Output</span>');
+	var select = $('<select class="form-select form-select-sm" id="sttOutputLanguage" style="width:auto"></select>');
+	[
+		{ value: 'en-US', label: 'English (US)' },
+		{ value: 'es', label: 'Spanish' },
+		{ value: 'fr', label: 'French' },
+		{ value: 'de', label: 'German' },
+		{ value: 'it', label: 'Italian' },
+		{ value: 'pt', label: 'Portuguese' },
+		{ value: 'ja', label: 'Japanese' },
+		{ value: 'ko', label: 'Korean' },
+		{ value: 'zh', label: 'Chinese' }
+	].forEach(function(opt) {
+		select.append($('<option></option>').attr('value', opt.value).text(opt.label));
+	});
+	select.val('en-US');
+	wrap.append(select);
+	row.append(wrap);
+}
+
+function sendOutputLanguageUpdate() {
+	if(!audiobridgeHandle || !myid)
+		return;
+	var lang = getSelectedOutputLanguage();
+	audiobridgeHandle.send({
+		message: {
+			request: 'configure',
+			abmod_config: JSON.stringify({ 'set-output-language': lang })
+		}
+	});
+	$('#sttStatus').text('output=' + lang);
+}
+
 function buildAbmodConfig() {
 	var provider = $('#sttProvider').val() || 'aws';
+	var outputLanguage = getSelectedOutputLanguage();
 	if(provider === 'openai') {
 		var cfg = {
 			provider: 'openai',
 			openai_model: $('#openaiModel').val() || 'gpt-4o-transcribe',
-			openai_language: 'en'
+			openai_language: 'en',
+			output_language: outputLanguage
 		};
 		var concurrent = parseInt($('#openaiConcurrent').val(), 10);
 		if(concurrent > 1) cfg.openai_concurrent = concurrent;
@@ -138,7 +186,8 @@ function buildAbmodConfig() {
 		aws_session_id: generateUUID(),
 		aws_medical_redaction: false,
 		aws_fast_mode: $('#awsFastMode').is(':checked'),
-		aws_vocabulary_name:'test'
+		aws_vocabulary_name:'test',
+		output_language: outputLanguage
 	};
 	var vocabPrompt = $('#awsVocabPrompt').val().trim();
 	if(vocabPrompt) awsCfg.aws_vocabulary_prompt = vocabPrompt;
@@ -325,6 +374,7 @@ function setupWebRTC() {
 $(document).ready(function() {
 	$('#room').addClass('hide');
 	$('#audiojoin').addClass('hide');
+	ensureOutputLanguageControl();
 
 	Janus.init({ debug: 'all', callback: function() {
 		$('#start').one('click', function() {
@@ -430,15 +480,23 @@ $(document).ready(function() {
 			abmod_load: ABMOD_SO_PATH,
 			abmod_config: JSON.stringify(cfg)
 		}});
+		sttAbmodLoaded = true;
 		$(this).prop('disabled', true);
 		$('#unloadabmod').prop('disabled', false);
 		$('#sttStatus').text('loading\u2026');
+	});
+
+	// Runtime output-language switch
+	$(document).on('change', '#sttOutputLanguage', function() {
+		if(sttAbmodLoaded)
+			sendOutputLanguageUpdate();
 	});
 
 	// Unload ABMod
 	$('#unloadabmod').on('click', function() {
 		if(!myid) return;
 		audiobridgeHandle.send({ message: { request: 'configure', abmod_unload: true } });
+		sttAbmodLoaded = false;
 		$(this).prop('disabled', true);
 		$('#loadabmod').prop('disabled', false);
 		$('#sttStatus').text('idle');

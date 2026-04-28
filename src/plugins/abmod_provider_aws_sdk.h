@@ -57,6 +57,17 @@ int abmod_aws_native_stream_send_pcm(void *stream,
 
 void abmod_aws_native_stream_close(void *stream);
 
+/* Translate text using AWS Translate.
+ * Returns 0 on success and stores a heap-allocated UTF-8 string in out_text
+ * (caller must free with free()). Returns -1 on failure and optionally stores
+ * a heap-allocated error string in out_error (caller must free with free()). */
+int abmod_aws_native_translate_text_dup(const AbmodAwsNativeConfig *cfg,
+		const char *source_language_code,
+		const char *target_language_code,
+		const char *text,
+		char **out_text,
+		char **out_error);
+
 /* Create a temporary vocabulary from comma-separated prompt phrases.
  * Generates a unique name, polls until READY (up to max_wait_seconds),
  * writes the name into out_name (caller-supplied buffer of out_name_len bytes).

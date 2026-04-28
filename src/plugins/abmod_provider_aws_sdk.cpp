@@ -9,10 +9,12 @@
 #include "abmod_provider_aws_sdk.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -20,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -49,6 +52,14 @@
 #  include <aws/transcribe/model/VocabularyState.h>
 #else
 #  define ABMOD_HAS_TRANSCRIBE_VOCAB 0
+#endif
+#if defined(HAVE_AWS_TRANSLATE_SDK) || \
+	(!defined(HAVE_CONFIG_H) && __has_include(<aws/translate/TranslateClient.h>))
+#  define ABMOD_HAS_TRANSLATE_SDK 1
+#  include <aws/translate/TranslateClient.h>
+#  include <aws/translate/model/TranslateTextRequest.h>
+#else
+#  define ABMOD_HAS_TRANSLATE_SDK 0
 #endif
 #include <aws/transcribestreaming/TranscribeStreamingServiceClient.h>
 #include <aws/transcribestreaming/model/AudioEvent.h>
@@ -111,6 +122,78 @@ static Type parse_type(const char *t) {
 		return Type::DICTATION;
 	return Type::CONVERSATION;
 }
+
+static std::string normalize_translate_lang(const char *lang, bool allow_auto) {
+	if(!lang || !*lang)
+		return allow_auto ? "auto" : "en";
+	std::string s(lang);
+	for(size_t i = 0; i < s.size(); ++i) {
+		unsigned char ch = static_cast<unsigned char>(s[i]);
+		if(s[i] == '_')
+			s[i] = '-';
+		else
+			s[i] = static_cast<char>(std::tolower(ch));
+	}
+	if(allow_auto && s == "auto")
+		return s;
+	if(s.rfind("zh", 0) == 0)
+		return "zh";
+	size_t dash = s.find('-');
+	if(dash != std::string::npos && dash > 0)
+		s = s.substr(0, dash);
+	if(s.empty())
+		return allow_auto ? "auto" : "en";
+	return s;
+}
+
+#if ABMOD_HAS_TRANSLATE_SDK
+static std::mutex g_translate_client_cache_mutex;
+static std::unordered_map<std::string, std::weak_ptr<Aws::Translate::TranslateClient>> g_translate_client_cache;
+
+static std::string make_translate_client_cache_key(const AbmodAwsNativeConfig *cfg) {
+	std::string region = (cfg && cfg->region && *cfg->region) ? cfg->region : "us-east-1";
+	std::string access = (cfg && cfg->access_key_id) ? cfg->access_key_id : "";
+	std::string secret = (cfg && cfg->secret_access_key) ? cfg->secret_access_key : "";
+	std::string token = (cfg && cfg->session_token) ? cfg->session_token : "";
+	/* Credentials/region define client identity for reuse. */
+	return region + "|" + access + "|" + secret + "|" + token;
+}
+
+static std::shared_ptr<Aws::Translate::TranslateClient> get_translate_client(const AbmodAwsNativeConfig *cfg) {
+	ClientConfiguration client_cfg;
+	client_cfg.region = (cfg && cfg->region && *cfg->region) ? cfg->region : "us-east-1";
+
+	std::string cache_key = make_translate_client_cache_key(cfg);
+	{
+		std::lock_guard<std::mutex> lk(g_translate_client_cache_mutex);
+		auto it = g_translate_client_cache.find(cache_key);
+		if(it != g_translate_client_cache.end()) {
+			auto cached = it->second.lock();
+			if(cached)
+				return cached;
+		}
+	}
+
+	std::shared_ptr<Aws::Translate::TranslateClient> client;
+	if(cfg && cfg->access_key_id && *cfg->access_key_id && cfg->secret_access_key && *cfg->secret_access_key) {
+		if(cfg->session_token && *cfg->session_token) {
+			AWSCredentials creds(cfg->access_key_id, cfg->secret_access_key, cfg->session_token);
+			client = std::make_shared<Aws::Translate::TranslateClient>(creds, client_cfg);
+		} else {
+			AWSCredentials creds(cfg->access_key_id, cfg->secret_access_key);
+			client = std::make_shared<Aws::Translate::TranslateClient>(creds, client_cfg);
+		}
+	} else {
+		client = std::make_shared<Aws::Translate::TranslateClient>(client_cfg);
+	}
+
+	if(client) {
+		std::lock_guard<std::mutex> lk(g_translate_client_cache_mutex);
+		g_translate_client_cache[cache_key] = client;
+	}
+	return client;
+}
+#endif
 
 /* Max PCM chunks buffered before we start dropping (prevents unbounded growth
  * when AWS is slow or the connection stalls). At 960 samples / 16 kHz =
@@ -468,6 +551,54 @@ void abmod_aws_native_stream_close(void *stream) {
 		return;
 	s->close_internal();
 	delete s;
+}
+
+int abmod_aws_native_translate_text_dup(const AbmodAwsNativeConfig *cfg,
+		const char *source_language_code,
+		const char *target_language_code,
+		const char *text,
+		char **out_text,
+		char **out_error) {
+	if(out_text)
+		*out_text = nullptr;
+	if(out_error)
+		*out_error = nullptr;
+	if(!out_text || !target_language_code || !*target_language_code || !text || !*text)
+		return -1;
+
+	std::string source = normalize_translate_lang(source_language_code, true);
+	std::string target = normalize_translate_lang(target_language_code, false);
+	if(source == target) {
+		*out_text = ::strdup(text);
+		return *out_text ? 0 : -1;
+	}
+
+#if ABMOD_HAS_TRANSLATE_SDK
+	auto client = get_translate_client(cfg);
+	if(!client) {
+		if(out_error)
+			*out_error = ::strdup("failed to initialize AWS Translate client");
+		return -1;
+	}
+
+	Aws::Translate::Model::TranslateTextRequest req;
+	req.SetText(text);
+	req.SetSourceLanguageCode(source.c_str());
+	req.SetTargetLanguageCode(target.c_str());
+	auto outcome = client->TranslateText(req);
+	if(!outcome.IsSuccess()) {
+		if(out_error)
+			*out_error = ::strdup(outcome.GetError().GetMessage().c_str());
+		return -1;
+	}
+	*out_text = ::strdup(outcome.GetResult().GetTranslatedText().c_str());
+	return *out_text ? 0 : -1;
+#else
+	(void)cfg;
+	if(out_error)
+		*out_error = ::strdup("AWS Translate SDK not available in this build");
+	return -1;
+#endif
 }
 
 #if ABMOD_HAS_TRANSCRIBE_VOCAB

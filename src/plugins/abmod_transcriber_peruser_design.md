@@ -6,6 +6,8 @@ Provide a single AudioBridge extension module that can transcribe:
 
 - **Per-participant PCM** (default) via `abmod_on_participant_pcm`
 - **Mixed PCM** (optional) via `abmod_on_mix` when enabled
+- **Translated text output** (AWS-only for now) when output language differs from input language
+- **Per-participant output language routing** at runtime
 
 Transcription is provider-modular:
 
@@ -69,6 +71,12 @@ Module: `src/plugins/abmod_transcriber_template.c`
 - Emits Janus events:
   - `transcription`
   - `error`
+- Translation path is executed in the transcript callback path (not in decode/mix thread):
+  - Primary output language is `output_language` (or falls back to `aws_language_code`).
+  - If source and target differ, text is translated via AWS Translate.
+  - Additional fan-out translations are emitted from runtime participant preferences.
+  - Partial transcripts are translated only when `translate_partials=true`.
+  - Participant-specific target language is runtime state (set on connect/join, and updatable after connect), not a required static startup parameter.
 
 ### 4) Provider abstraction
 
@@ -95,6 +103,8 @@ Implementation: `abmod_provider_aws.c` (configuration and stream registry) plus 
 - One **StartMedicalStreamTranscription** session per `room_id|user_id`; PCM is sent as `AudioEvent` frames on the bidirectional stream (same service as the old websocket endpoint, but via the SDK).
 - Credentials: default AWS provider chain (environment, shared config, IAM role, etc.); optional explicit keys via `abmod_config` or `AWS_*` env vars.
 - Multi-channel input is mixed down to mono in the native layer before sending.
+- Translation uses AWS Translate (`TranslateText`) through the same SDK bridge (`abmod_provider_aws_sdk.cpp`).
+- If aws-cpp-sdk-translate is not available at configure time, translation helper returns an error and the module falls back to source text for primary output.
 
 ## Configuration Contract (`abmod_config`)
 
@@ -112,6 +122,14 @@ Supported keys:
 - `aws_access_key_id` (optional override; prefer environment variable)
 - `aws_secret_access_key` (optional override; prefer environment variable)
 - `aws_session_token` (optional; for temporary credentials)
+- `output_language` (default output language for emitted transcript text)
+- `translate_partials` (boolean, default `false`; when `true`, partial transcripts are translated too)
+
+Runtime participant preference API (recommended):
+
+- participant chooses expected transcript language when connecting/joining room
+- participant may update expected transcript language after connect
+- module keeps per-room/per-user target-language map in memory and applies it during transcript fan-out
 
 Legacy keys `aws_ws_url`, `aws_sigv4_expires`, and `aws_query_overrides` are ignored (kept for backward-compatible configs).
 
@@ -121,6 +139,8 @@ Example:
 {
   "provider": "aws",
   "aws_language_code": "en-US",
+  "output_language": "es",
+  "translate_partials": false,
   "aws_region": "us-east-1",
   "aws_specialty": "PRIMARYCARE",
   "aws_stream_type": "CONVERSATION",
@@ -154,18 +174,19 @@ Payload fields emitted by per-user module:
 - `provider`
 - `room_id`
 - `user_id`
-- `user` (compat alias of `user_id`)
 - `language`
 - `text`
-- `transcript` (compat alias of `text`)
 - `item_id` (stable user-based key)
+- `translated` (`true` when the emitted text is translated)
+- `source_language` (present when known)
+- `source_text` (present on translated emissions)
+- `target_user_id` (present for participant-targeted fan-out from runtime preference)
 - `type` (`partial`, `final`, `error`, `auth_error`)
 - `ts_us`
 
 Errors include:
 
-- `message`
-- `text` (compat alias)
+- `text`
 - `type` (`error` or `auth_error`)
 
 ## Threading and Performance
@@ -205,6 +226,10 @@ Runtime loading still uses AudioBridge `configure` API:
 
 - Multi-user room: verify each speaker gets attributed partial/final events.
 - Overlap speech: verify simultaneous streams and independent transcripts.
+- Source equals output language: verify no translation call is needed and source text is emitted.
+- Source differs from output language: verify translated primary output is emitted.
+- Participant-specific fan-out: verify runtime set/update of participant expected language changes emitted language without restart.
+- Partial translation toggle: verify partials stay source text when `translate_partials=false`.
 - Under provider slowdown/backpressure: verify AudioBridge participant/decode threads do not block.
 - Queue saturation: verify stale PCM may be dropped but `stopped-talking` still results in stream close.
 - Unload/reload: verify clean stream teardown and re-init.
