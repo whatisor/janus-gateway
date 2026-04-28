@@ -72,11 +72,21 @@ function escapeHtml(v) {
 	return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function sttUpdatePartial(itemId, userKey, displayName, text) {
+function sttFormatGenderTag(payload) {
+	if(!payload || !payload.gender) return '';
+	var label = String(payload.gender);
+	var conf = Number(payload.gender_confidence);
+	if(Number.isFinite(conf))
+		return ' <span class="text-muted">(' + escapeHtml(label) + ' ' + Math.round(conf * 100) + '%)</span>';
+	return ' <span class="text-muted">(' + escapeHtml(label) + ')</span>';
+}
+
+function sttUpdatePartial(itemId, userKey, displayName, text, payload) {
 	var ul = document.getElementById('sttConversation');
 	if(!ul || !text || !text.trim()) return;
 	var key = itemId || 'unknown';
 	var item = sttPartialItems[key];
+	var genderTag = sttFormatGenderTag(payload);
 	if(!item) {
 		var li = document.createElement('li');
 		li.className = 'list-group-item list-group-item-info';
@@ -87,23 +97,24 @@ function sttUpdatePartial(itemId, userKey, displayName, text) {
 	}
 	item.displayName = displayName || item.displayName;
 	item.li.innerHTML = '<strong>' + escapeHtml(item.displayName || userKey) + ':</strong> ' +
-		escapeHtml(text) + ' <em class="text-muted">(partial)</em>';
+		escapeHtml(text) + genderTag + ' <em class="text-muted">(partial)</em>';
 	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
 }
 
-function sttFinalize(itemId, userKey, displayName, text) {
+function sttFinalize(itemId, userKey, displayName, text, payload) {
 	var ul = document.getElementById('sttConversation');
 	if(!ul) return;
 	var key = itemId || 'unknown';
 	var item = sttPartialItems[key];
 	var finalText = (text && text.trim()) ? text : (item ? item.text : '');
+	var genderTag = sttFormatGenderTag(payload);
 	if(item && item.li) { try { ul.removeChild(item.li); } catch(e) {} delete sttPartialItems[key]; }
 	if(!finalText) return;
 	var li = document.createElement('li');
 	li.className = 'list-group-item list-group-item-light';
 	var ts = new Date().toLocaleTimeString();
 	li.innerHTML = '<small class="text-muted">[' + ts + ']</small> ' +
-		'<strong>' + escapeHtml(displayName || userKey || 'Unknown') + ':</strong> ' + escapeHtml(finalText);
+		'<strong>' + escapeHtml(displayName || userKey || 'Unknown') + ':</strong> ' + escapeHtml(finalText) + genderTag;
 	ul.appendChild(li);
 	ul.parentElement.scrollTop = ul.parentElement.scrollHeight;
 }
@@ -150,11 +161,13 @@ function generateUUID() {
 
 function buildAbmodConfig() {
 	var provider = $('#sttProvider').val() || 'aws';
+	var genderEnabled = $('#genderEnabled').length ? $('#genderEnabled').is(':checked') : true;
 	if(provider === 'openai') {
 		var cfg = {
 			provider: 'openai',
 			openai_model: $('#openaiModel').val() || 'gpt-4o-transcribe',
-			openai_language: 'en'
+			openai_language: 'en',
+			gender_enabled: genderEnabled
 		};
 		var concurrent = parseInt($('#openaiConcurrent').val(), 10);
 		if(concurrent > 1) cfg.openai_concurrent = concurrent;
@@ -163,6 +176,7 @@ function buildAbmodConfig() {
 	}
 	var awsCfg = {
 		provider: 'aws',
+		gender_enabled: genderEnabled,
 		aws_language_code: 'en-US',
 		aws_region: 'us-east-1',
 		aws_specialty: 'PRIMARYCARE',
@@ -326,10 +340,10 @@ function handleMessage(msg, jsep) {
 		if(sttType === 'transcription' || sttType === 'transcript') {
 			$('#sttStatus').text(payloadType === 'final' ? 'final' : 'listening\u2026');
 			if(payloadType === 'partial') {
-				sttUpdatePartial(itemId, String(userField), who, text);
+				sttUpdatePartial(itemId, String(userField), who, text, payload);
 			} else if(payloadType === 'final' || !payloadType) {
 				/* Treat missing type as finalized text for compatibility with older emitters. */
-				sttFinalize(itemId, String(userField), who, text);
+				sttFinalize(itemId, String(userField), who, text, payload);
 			}
 		} else if(sttType === 'error') {
 			$('#sttStatus').text('error');

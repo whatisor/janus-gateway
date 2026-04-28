@@ -103,6 +103,11 @@ Implementation: `abmod_provider_aws.c` (configuration and stream registry) plus 
 Supported keys:
 
 - `provider` (currently `aws`)
+- `gender_enabled` (default `false`; run one-shot gender detection per participant)
+- `gender_model_path` (path to ONNX model used for one-shot gender detection)
+- `gender_window_ms` (default `3000`; amount of audio buffered before one-shot inference)
+- `gender_min_confidence` (default `0.60`; minimum confidence required to emit gender)
+- `gender_max_buffer_ms` (default `6000`; cap for buffered audio before one-shot decision)
 - `aws_language_code` (default `en-US`; AWS Medical Streaming only supports `en-US` — the SDK layer hardcodes this regardless of the configured value)
 - `aws_region` (default `us-east-1`)
 - `aws_specialty` (default `PRIMARYCARE`; the SDK layer currently hardcodes `PRIMARYCARE` regardless of this value — extend `parse_specialty()` in `abmod_provider_aws_sdk.cpp` to support other values)
@@ -160,6 +165,9 @@ Payload fields emitted by per-user module:
 - `transcript` (compat alias of `text`)
 - `item_id` (stable user-based key)
 - `type` (`partial`, `final`, `error`, `auth_error`)
+- `gender` (optional, present after one-shot gender detection succeeds)
+- `gender_confidence` (optional confidence for the `gender` label)
+- `gender_status` (`pending`, `ready`, `unavailable`, `disabled`)
 - `ts_us`
 
 Errors include:
