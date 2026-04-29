@@ -22,6 +22,7 @@
 
 #include "janus_ab_module.h"
 #include "abmod_provider.h"
+#include "abmod_gender.h"
 
 /* Simple stderr logger — visible in `docker logs janus-gateway` */
 #define ABMOD_LOG(fmt, ...) \
@@ -79,6 +80,7 @@ typedef struct abmod_ctx_s {
 	size_t size;
 	GHashTable *active_streams;
 	abmod_provider *provider;
+	abmod_gender_engine *gender;
 } abmod_ctx;
 
 /* Internal queue helper used by callbacks declared later in the file. */
@@ -133,17 +135,19 @@ static void abmod_on_transcript(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		float transcript_confidence,
 		int is_final,
 		const char *item_id) {
 	abmod_ctx *ctx = (abmod_ctx *)user;
 	if(!ctx)
 		return;
-	ABMOD_LOG("transcript [%s] room=%s user=%s item_id=%s %s: %s",
+	ABMOD_LOG("transcript [%s] room=%s user=%s item_id=%s %s conf=%.3f: %s",
 		provider_name ? provider_name : "?",
 		room_id ? room_id : "?",
 		user_id ? user_id : "?",
 		item_id ? item_id : "?",
 		is_final ? "FINAL" : "partial",
+		transcript_confidence,
 		text ? text : "(empty)");
 	json_t *payload = json_object();
 	json_object_set_new(payload, "provider", json_string(provider_name ? provider_name : "aws"));
@@ -152,7 +156,21 @@ static void abmod_on_transcript(void *user,
 	json_object_set_new(payload, "item_id", json_string(item_id ? item_id : ""));
 	json_object_set_new(payload, "language", json_string(ctx->language ? ctx->language : "en-US"));
 	json_object_set_new(payload, "text", json_string(text ? text : ""));
+	json_object_set_new(payload, "transcript_confidence", json_real(transcript_confidence));
 	json_object_set_new(payload, "type", json_string(is_final ? "final" : "partial"));
+	char gender_label[32] = {0};
+	float gender_confidence = 0.0f;
+	const char *gender_status = "disabled";
+	if(room_id && user_id && ctx->gender) {
+		abmod_gender_trigger_on_transcript(ctx->gender, room_id, user_id, text, transcript_confidence, is_final);
+		if(abmod_gender_get_result(ctx->gender, room_id, user_id,
+				gender_label, sizeof(gender_label),
+				&gender_confidence, &gender_status)) {
+			json_object_set_new(payload, "gender", json_string(gender_label));
+			json_object_set_new(payload, "gender_confidence", json_real(gender_confidence));
+		}
+	}
+	json_object_set_new(payload, "gender_status", json_string(gender_status ? gender_status : "disabled"));
 	json_object_set_new(payload, "ts_us", json_integer((json_int_t)g_get_real_time()));
 	abmod_emit(ctx, "transcription", payload);
 	json_decref(payload);
@@ -304,9 +322,15 @@ static void *abmod_worker(void *arg) {
 				abmod_ensure_stream_locked(ctx, item.room_id, item.user_id,
 					ctx->rate, ctx->channels);
 			else if(strcmp(item.event_name, "muted") == 0
-				|| strcmp(item.event_name, "left") == 0 || strcmp(item.event_name, "idle_timeout") == 0)
+				|| strcmp(item.event_name, "left") == 0 || strcmp(item.event_name, "idle_timeout") == 0) {
 				abmod_close_stream_locked(ctx, item.room_id, item.user_id);
+				if(strcmp(item.event_name, "left") == 0 || strcmp(item.event_name, "idle_timeout") == 0)
+					abmod_gender_clear_user(ctx->gender, item.room_id, item.user_id);
+			}
 		} else if(item.type == ABMOD_ITEM_PCM_USER || item.type == ABMOD_ITEM_PCM_MIX) {
+			if(item.type == ABMOD_ITEM_PCM_USER)
+				abmod_gender_on_pcm(ctx->gender, item.room_id, item.user_id,
+					item.pcm, item.samples, item.sampling_rate, item.channels);
 			if(abmod_ensure_stream_locked(ctx, item.room_id, item.user_id, item.sampling_rate, item.channels) == 0)
 				abmod_provider_send_pcm(ctx->provider, item.room_id, item.user_id,
 					item.pcm, item.samples, item.sampling_rate, item.channels);
@@ -336,6 +360,7 @@ void* abmod_create(uint32_t sampling_rate, int channels,
 	pthread_mutex_init(&ctx->lock, NULL);
 	pthread_cond_init(&ctx->cv, NULL);
 	ctx->active_streams = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	ctx->gender = abmod_gender_create(config_json);
 
 	if(config_json) {
 		json_error_t jerr;
@@ -380,6 +405,7 @@ void* abmod_create(uint32_t sampling_rate, int channels,
 	if(pthread_create(&ctx->worker_thread, NULL, abmod_worker, ctx) != 0) {
 		ctx->running = 0;
 		abmod_provider_destroy(ctx->provider);
+		abmod_gender_destroy(ctx->gender);
 		g_hash_table_destroy(ctx->active_streams);
 		pthread_cond_destroy(&ctx->cv);
 		pthread_mutex_destroy(&ctx->lock);
@@ -406,6 +432,7 @@ void abmod_destroy(void *vctx) {
 	for(size_t i = 0; i < ABMOD_QCAP; ++i)
 		abmod_queue_item_reset(&ctx->queue[i]);
 	abmod_provider_destroy(ctx->provider);
+	abmod_gender_destroy(ctx->gender);
 	g_hash_table_destroy(ctx->active_streams);
 	pthread_cond_destroy(&ctx->cv);
 	pthread_mutex_destroy(&ctx->lock);

@@ -59,6 +59,11 @@ static int abmod_file_exists(const char *path) {
 typedef struct openai_provider_s   openai_provider;
 typedef struct openai_stream_s     openai_stream;
 typedef struct openai_user_session_s openai_user_session;
+int abmod_provider_openai_init(const char *config_json,
+		const abmod_provider_callbacks *cbs,
+		void *cb_user,
+		void **out_impl,
+		const abmod_provider_vtbl **out_vtbl);
 
 /* ── Message queue ───────────────────────────────────────────────── */
 
@@ -306,7 +311,7 @@ static void openai_guard_resolve(openai_provider *p, openai_bucket *b) {
 emit:
 	if(p->cbs.on_transcript)
 		p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-			b->room_id, b->user_id, best, b->item_id, 1);
+			b->room_id, b->user_id, best, -1.0f, 1, b->item_id);
 	openai_provider_clear_session_item_if_matches(p,
 		b->room_id, b->user_id, b->item_id);
 	for(int i = 0; i < b->count; i++) free(b->texts[i]);
@@ -429,7 +434,7 @@ static void openai_stream_on_transcript_internal(openai_stream *s,
 		/* Mini stream: everything is a partial */
 		if(p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, item_id, 0);
+				s->room_id, s->user_id, text, -1.0f, 0, item_id);
 		free(item_id);
 		return;
 	}
@@ -438,7 +443,7 @@ static void openai_stream_on_transcript_internal(openai_stream *s,
 		/* Single main stream: pass through unchanged */
 		if(p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, item_id, is_final);
+				s->room_id, s->user_id, text, -1.0f, is_final, item_id);
 		if(is_final)
 			openai_session_clear_item_if_matches(s->session, item_id);
 		free(item_id);
@@ -450,7 +455,7 @@ static void openai_stream_on_transcript_internal(openai_stream *s,
 		/* Partials from main streams: forward only when there is no mini stream */
 		if(!p->fast_mode && p->cbs.on_transcript)
 			p->cbs.on_transcript(p->cb_user, OPENAI_PROVIDER_NAME,
-				s->room_id, s->user_id, text, item_id, 0);
+				s->room_id, s->user_id, text, -1.0f, 0, item_id);
 		free(item_id);
 		return;
 	}

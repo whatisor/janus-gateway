@@ -411,12 +411,14 @@ endif
 # Build the sample AudioBridge custom module as a separate shared object
 # Install it under lib/janus/abmodules so Janus won't auto-load it as a core plugin
 abmoduledir = $(libdir)/janus/abmodules
-abmodule_LTLIBRARIES = plugins/libabmod_transcriber_template.la
+abmodule_LTLIBRARIES = plugins/libabmod_transcriber_template.la \
+	plugins/libabmod_gender_onnx.la
 plugins_libabmod_transcriber_template_la_SOURCES = \
     plugins/abmod_transcriber_template.c \
     plugins/abmod_provider.c \
     plugins/abmod_provider_aws.c \
     plugins/abmod_provider_openai.c \
+    plugins/abmod_gender.h \
     plugins/abmod_embedding.h \
     plugins/janus_ab_module.h \
     plugins/abmod_provider.h \
@@ -431,6 +433,7 @@ plugins_libabmod_transcriber_template_la_SOURCES = \
 # Default model directory baked in at compile time so the provider can
 # auto-load the embedding model without any runtime configuration.
 abmod_embedding_default_dir = $(datadir)/janus/models/all-MiniLM-L6-v2
+abmod_gender_default_model = $(datadir)/janus/models/gender/model.onnx
 plugins_libabmod_transcriber_template_la_CFLAGS = \
     $(plugins_cflags) \
     -DOUTSIDE_SPEEX -DRANDOM_PREFIX=abmod_speex \
@@ -440,8 +443,26 @@ plugins_libabmod_transcriber_template_la_CFLAGS = \
 plugins_libabmod_transcriber_template_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version $(WS_MANUAL_LIBS)
 plugins_libabmod_transcriber_template_la_LIBADD = $(plugins_libadd)
 
+# Optional ONNX-based gender detector AB module (per-user PCM path).
+plugins_libabmod_gender_onnx_la_SOURCES = plugins/janus_ab_module.h
+plugins_libabmod_gender_onnx_la_CFLAGS = $(plugins_cflags)
+plugins_libabmod_gender_onnx_la_LDFLAGS = $(plugins_ldflags) -module -avoid-version
+plugins_libabmod_gender_onnx_la_LIBADD = $(plugins_libadd)
+
+if ENABLE_ABMOD_EMBEDDING
+plugins_libabmod_gender_onnx_la_SOURCES += plugins/abmod_gender_onnx.cpp
+plugins_libabmod_gender_onnx_la_CXXFLAGS = \
+	$(AM_CXXFLAGS) $(plugins_cflags) $(ABMOD_ONNXRT_CPPFLAGS) \
+	-DABMOD_GENDER_DEFAULT_MODEL=\"$(abmod_gender_default_model)\" \
+	-std=c++17
+plugins_libabmod_gender_onnx_la_LIBADD += $(ABMOD_ONNXRT_LIBS) -lstdc++
+else
+plugins_libabmod_gender_onnx_la_SOURCES += plugins/abmod_gender_onnx_stub.c
+endif
+
 if ENABLE_ABMOD_EMBEDDING
 plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_embedding.cpp
+plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_gender.cpp
 plugins_libabmod_transcriber_template_la_CXXFLAGS = \
     $(AM_CXXFLAGS) $(plugins_cflags) \
     $(ABMOD_ONNXRT_CPPFLAGS) \
@@ -449,10 +470,12 @@ plugins_libabmod_transcriber_template_la_CXXFLAGS = \
     -I$(top_srcdir)/src/plugins/audiobridge-deps/speex \
     -I$(top_srcdir)/src/plugins/audiobridge-deps \
     -DABMOD_EMBEDDING_DEFAULT_DIR=\"$(abmod_embedding_default_dir)\" \
+    -DABMOD_GENDER_DEFAULT_MODEL=\"$(abmod_gender_default_model)\" \
     -std=c++17
 plugins_libabmod_transcriber_template_la_LIBADD += $(ABMOD_ONNXRT_LIBS) -lstdc++
 else
 plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_embedding_stub.c
+plugins_libabmod_transcriber_template_la_SOURCES += plugins/abmod_gender_stub.c
 endif
 
 if ENABLE_ABMOD_AWS_SDK
@@ -481,11 +504,26 @@ endif
 # ── Embedding model download ────────────────────────────────────────────────
 EMBEDDING_MODEL_DIR = $(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2
 HF_BASE = https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+GENDER_MODEL_DIR = $(DESTDIR)$(datadir)/janus/models/gender
+# Set ABMOD_GENDER_MODEL_URL at configure/build/install time to a direct .onnx URL.
+GENDER_MODEL_URL ?= https://huggingface.co/prithivMLmods/Common-Voice-Gender-Detection-ONNX/resolve/main/onnx/model.onnx
 
 download-models:
 	@echo "Downloading all-MiniLM-L6-v2 model files to $(EMBEDDING_MODEL_DIR) ..."
 	$(MKDIR_P) "$(EMBEDDING_MODEL_DIR)"
 	$(top_srcdir)/scripts/download_embedding_model.sh "$(EMBEDDING_MODEL_DIR)"
+	@echo "Done. Run 'make install' to put Janus files in the configured prefix."
+
+download-models-gender:
+	@echo "Downloading gender model file to $(GENDER_MODEL_DIR) ..."
+	$(MKDIR_P) "$(GENDER_MODEL_DIR)"
+	@if [ -z "$(GENDER_MODEL_URL)" ]; then \
+		echo "ERROR: GENDER_MODEL_URL is empty."; \
+		echo "Set it to a direct .onnx URL, e.g. make download-models-gender GENDER_MODEL_URL=https://.../model.onnx"; \
+		exit 1; \
+	fi
+	ABMOD_GENDER_MODEL_URL="$(GENDER_MODEL_URL)" \
+		$(top_srcdir)/scripts/download_gender_model.sh "$(GENDER_MODEL_DIR)" "$(GENDER_MODEL_URL)"
 	@echo "Done. Run 'make install' to put Janus files in the configured prefix."
 
 EMBEDDING_HF_BASE = https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
@@ -512,8 +550,19 @@ install-data-local:
 	    { rm -f "$(DESTDIR)$(datadir)/janus/models/all-MiniLM-L6-v2/vocab.txt.tmp"; \
 	      echo "  [embedding] WARNING: failed to download vocab.txt — run 'make download-models' later"; }; \
 	fi
+	$(MKDIR_P) "$(GENDER_MODEL_DIR)"
+	@if [ ! -f "$(GENDER_MODEL_DIR)/model.onnx" ]; then \
+		if [ -n "$(GENDER_MODEL_URL)" ]; then \
+			echo "  [gender] Downloading model.onnx ..."; \
+			ABMOD_GENDER_MODEL_URL="$(GENDER_MODEL_URL)" \
+				$(top_srcdir)/scripts/download_gender_model.sh "$(GENDER_MODEL_DIR)" "$(GENDER_MODEL_URL)" || \
+			echo "  [gender] WARNING: failed to download model.onnx — run 'make download-models-gender GENDER_MODEL_URL=.../model.onnx' later"; \
+		else \
+			echo "  [gender] model.onnx not found and GENDER_MODEL_URL is empty — run 'make download-models-gender GENDER_MODEL_URL=.../model.onnx'"; \
+		fi; \
+	fi
 
-.PHONY: download-models
+.PHONY: download-models download-models-gender
 
 if ENABLE_PLUGIN_ECHOTEST
 plugin_LTLIBRARIES += plugins/libjanus_echotest.la

@@ -28,6 +28,7 @@ typedef void (*abmod_sdk_transcript_fn)(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		float transcript_confidence,
 		const char *item_id,
 		int is_final);
 
