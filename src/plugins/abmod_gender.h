@@ -22,6 +22,14 @@ void abmod_gender_on_pcm(abmod_gender_engine *engine,
 		uint32_t sampling_rate,
 		int channels);
 
+/* Transcript-aware trigger; gating policy is owned by gender engine config. */
+int abmod_gender_trigger_on_transcript(abmod_gender_engine *engine,
+		const char *room_id,
+		const char *user_id,
+		const char *text,
+		float transcript_confidence,
+		int is_final);
+
 /* Clear cached state for a participant (e.g., on leave). */
 void abmod_gender_clear_user(abmod_gender_engine *engine,
 		const char *room_id,

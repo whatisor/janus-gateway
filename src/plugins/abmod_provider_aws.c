@@ -85,14 +85,15 @@ static void sdk_on_text(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		float transcript_confidence,
 		const char *item_id,
 		int is_final) {
-	ABMOD_LOG("sdk_on_text room=%s user=%s %s item_id=%s: %s",
+	ABMOD_LOG("sdk_on_text room=%s user=%s %s item_id=%s conf=%.3f: %s",
 		room_id ? room_id : "?", user_id ? user_id : "?",
-		is_final ? "FINAL" : "partial", item_id ? item_id : "?", text ? text : "(empty)");
+		is_final ? "FINAL" : "partial", item_id ? item_id : "?", transcript_confidence, text ? text : "(empty)");
 	abmod_provider_aws *p = (abmod_provider_aws *)user;
 	if(p && p->cbs.on_transcript)
-		p->cbs.on_transcript(p->cb_user, ABMOD_AWS_PROVIDER_NAME, room_id, user_id, text, is_final, item_id);
+		p->cbs.on_transcript(p->cb_user, ABMOD_AWS_PROVIDER_NAME, room_id, user_id, text, transcript_confidence, is_final, item_id);
 }
 
 static void sdk_on_err(void *user,

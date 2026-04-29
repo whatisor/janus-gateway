@@ -350,8 +350,7 @@ static void *abmod_worker(void *arg) {
 			}
 			abmod_handle_user_infer(ctx, item.pcm.room_id, item.pcm.user_id);
 		} else if(item.type == 2) {
-			if(item.evt.event_name == "left" || item.evt.event_name == "muted" ||
-					item.evt.event_name == "stopped-talking") {
+			if(item.evt.event_name == "left") {
 				std::string key = abmod_key(item.evt.room_id, item.evt.user_id);
 				ctx->users.erase(key);
 			}

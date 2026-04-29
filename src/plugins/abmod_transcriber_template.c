@@ -135,17 +135,19 @@ static void abmod_on_transcript(void *user,
 		const char *room_id,
 		const char *user_id,
 		const char *text,
+		float transcript_confidence,
 		int is_final,
 		const char *item_id) {
 	abmod_ctx *ctx = (abmod_ctx *)user;
 	if(!ctx)
 		return;
-	ABMOD_LOG("transcript [%s] room=%s user=%s item_id=%s %s: %s",
+	ABMOD_LOG("transcript [%s] room=%s user=%s item_id=%s %s conf=%.3f: %s",
 		provider_name ? provider_name : "?",
 		room_id ? room_id : "?",
 		user_id ? user_id : "?",
 		item_id ? item_id : "?",
 		is_final ? "FINAL" : "partial",
+		transcript_confidence,
 		text ? text : "(empty)");
 	json_t *payload = json_object();
 	json_object_set_new(payload, "provider", json_string(provider_name ? provider_name : "aws"));
@@ -154,11 +156,13 @@ static void abmod_on_transcript(void *user,
 	json_object_set_new(payload, "item_id", json_string(item_id ? item_id : ""));
 	json_object_set_new(payload, "language", json_string(ctx->language ? ctx->language : "en-US"));
 	json_object_set_new(payload, "text", json_string(text ? text : ""));
+	json_object_set_new(payload, "transcript_confidence", json_real(transcript_confidence));
 	json_object_set_new(payload, "type", json_string(is_final ? "final" : "partial"));
 	char gender_label[32] = {0};
 	float gender_confidence = 0.0f;
 	const char *gender_status = "disabled";
 	if(room_id && user_id && ctx->gender) {
+		abmod_gender_trigger_on_transcript(ctx->gender, room_id, user_id, text, transcript_confidence, is_final);
 		if(abmod_gender_get_result(ctx->gender, room_id, user_id,
 				gender_label, sizeof(gender_label),
 				&gender_confidence, &gender_status)) {

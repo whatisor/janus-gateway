@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,7 @@
 struct GenderState {
 	bool attempted = false;
 	bool known = false;
+	bool trigger_wait_logged = false;
 	std::string label;
 	float confidence = 0.0f;
 	std::vector<float> mono16k;
@@ -39,6 +41,10 @@ struct abmod_gender_engine {
 	size_t window_samples = 3 * 16000;
 	float min_confidence = 0.60f;
 	size_t max_buffer_samples = 6 * 16000;
+	size_t trigger_min_chars = 4;
+	bool trigger_final_only = true;
+	float trigger_min_transcript_confidence = 0.50f;
+	bool trigger_allow_unknown_confidence = false;
 
 	Ort::Env *env = nullptr;
 	Ort::SessionOptions *opts = nullptr;
@@ -125,6 +131,24 @@ static bool parse_config(abmod_gender_engine *e, const char *config_json) {
 		if(v >= 2000 && v <= 15000)
 			e->max_buffer_samples = (size_t)((v * e->target_rate) / 1000);
 	}
+	json_t *trigger_min_chars = json_object_get(cfg, "gender_trigger_min_chars");
+	if(trigger_min_chars && json_is_integer(trigger_min_chars)) {
+		json_int_t v = json_integer_value(trigger_min_chars);
+		if(v >= 1 && v <= 256)
+			e->trigger_min_chars = (size_t)v;
+	}
+	json_t *trigger_final_only = json_object_get(cfg, "gender_trigger_final_only");
+	if(trigger_final_only)
+		e->trigger_final_only = json_is_true(trigger_final_only);
+	json_t *trigger_min_conf = json_object_get(cfg, "gender_trigger_min_transcript_confidence");
+	if(trigger_min_conf && (json_is_real(trigger_min_conf) || json_is_integer(trigger_min_conf))) {
+		double v = json_number_value(trigger_min_conf);
+		if(v >= 0.0 && v <= 1.0)
+			e->trigger_min_transcript_confidence = (float)v;
+	}
+	json_t *trigger_allow_unknown = json_object_get(cfg, "gender_trigger_allow_unknown_confidence");
+	if(trigger_allow_unknown)
+		e->trigger_allow_unknown_confidence = json_is_true(trigger_allow_unknown);
 	json_decref(cfg);
 	return true;
 }
@@ -217,8 +241,9 @@ static bool run_infer(abmod_gender_engine *e, const std::vector<float> &audio,
 extern "C" abmod_gender_engine *abmod_gender_create(const char *config_json) {
 	abmod_gender_engine *e = new abmod_gender_engine();
 	parse_config(e, config_json);
-	fprintf(stderr, "[ABMod][gender] create enabled=%d model=%s window_samples=%zu min_confidence=%.2f max_buffer_samples=%zu\n",
-		e->enabled ? 1 : 0, e->model_path.c_str(), e->window_samples, e->min_confidence, e->max_buffer_samples);
+	fprintf(stderr, "[ABMod][gender] create enabled=%d model=%s window_samples=%zu min_confidence=%.2f max_buffer_samples=%zu trigger_min_chars=%zu trigger_final_only=%d trigger_min_transcript_confidence=%.3f trigger_allow_unknown_confidence=%d\n",
+		e->enabled ? 1 : 0, e->model_path.c_str(), e->window_samples, e->min_confidence, e->max_buffer_samples,
+		e->trigger_min_chars, e->trigger_final_only ? 1 : 0, e->trigger_min_transcript_confidence, e->trigger_allow_unknown_confidence ? 1 : 0);
 	if(!e->enabled) {
 		fprintf(stderr, "[ABMod][gender] disabled via config (gender_enabled=false)\n");
 		e->ready = false;
@@ -248,12 +273,12 @@ extern "C" void abmod_gender_on_pcm(abmod_gender_engine *engine,
 		const int16_t *pcm, size_t samples, uint32_t sampling_rate, int channels) {
 	if(!engine || !engine->enabled || !engine->ready || !room_id || !user_id || !pcm || samples == 0)
 		return;
-	std::vector<float> mono = to_mono_16k(pcm, samples, sampling_rate, channels, engine->target_rate);
-	if(mono.empty())
-		return;
 	std::lock_guard<std::mutex> lk(engine->mtx);
 	GenderState &st = engine->users[key_for(room_id, user_id)];
 	if(st.attempted)
+		return;
+	std::vector<float> mono = to_mono_16k(pcm, samples, sampling_rate, channels, engine->target_rate);
+	if(mono.empty())
 		return;
 	st.mono16k.insert(st.mono16k.end(), mono.begin(), mono.end());
 	if(st.mono16k.size() > engine->max_buffer_samples) {
@@ -267,21 +292,74 @@ extern "C" void abmod_gender_on_pcm(abmod_gender_engine *engine,
 		}
 		return;
 	}
+	if(!st.trigger_wait_logged) {
+		fprintf(stderr, "[ABMod][gender] buffered room=%s user=%s samples=%zu (waiting transcript trigger)\n",
+			room_id, user_id, st.mono16k.size());
+		st.trigger_wait_logged = true;
+	}
+}
+
+static size_t count_nonspace_chars(const char *text) {
+	if(!text)
+		return 0;
+	size_t n = 0;
+	for(const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+		if(!isspace(*p))
+			++n;
+	}
+	return n;
+}
+
+static int abmod_gender_trigger_if_text(abmod_gender_engine *engine,
+		const char *room_id, const char *user_id,
+		const char *text, size_t min_chars) {
+	if(!engine || !engine->enabled || !engine->ready || !room_id || !user_id || !text)
+		return 0;
+	size_t text_len = count_nonspace_chars(text);
+	if(text_len < min_chars)
+		return 0;
+	std::lock_guard<std::mutex> lk(engine->mtx);
+	GenderState &st = engine->users[key_for(room_id, user_id)];
+	if(st.attempted)
+		return 0;
+	if(st.mono16k.size() < engine->window_samples) {
+		fprintf(stderr, "[ABMod][gender] trigger-deferred room=%s user=%s buffered=%zu/%zu text_len=%zu\n",
+			room_id, user_id, st.mono16k.size(), engine->window_samples, text_len);
+		return 0;
+	}
+	size_t start = st.mono16k.size() - engine->window_samples;
 	st.attempted = true;
-	std::vector<float> window(st.mono16k.begin(), st.mono16k.begin() + (ptrdiff_t)engine->window_samples);
+	std::vector<float> window(st.mono16k.begin() + (ptrdiff_t)start, st.mono16k.end());
 	std::string label;
 	float conf = 0.0f;
 	if(run_infer(engine, window, &label, &conf) && conf >= engine->min_confidence) {
 		st.known = true;
 		st.label = label;
 		st.confidence = conf;
-		fprintf(stderr, "[ABMod][gender] inferred room=%s user=%s label=%s confidence=%.3f\n",
-			room_id, user_id, st.label.c_str(), st.confidence);
+		fprintf(stderr, "[ABMod][gender] inferred room=%s user=%s label=%s confidence=%.3f (text_len=%zu)\n",
+			room_id, user_id, st.label.c_str(), st.confidence, text_len);
 	} else {
-		fprintf(stderr, "[ABMod][gender] unavailable room=%s user=%s (infer failed or confidence below %.2f)\n",
+		fprintf(stderr, "[ABMod][gender] unavailable room=%s user=%s (trigger infer failed or confidence below %.2f)\n",
 			room_id, user_id, engine->min_confidence);
 	}
 	std::vector<float>().swap(st.mono16k);
+	return 1;
+}
+
+extern "C" int abmod_gender_trigger_on_transcript(abmod_gender_engine *engine,
+		const char *room_id, const char *user_id,
+		const char *text, float transcript_confidence, int is_final) {
+	if(!engine || !engine->enabled || !engine->ready)
+		return 0;
+	if(engine->trigger_final_only && !is_final)
+		return 0;
+	if(transcript_confidence < 0.0f) {
+		if(!engine->trigger_allow_unknown_confidence)
+			return 0;
+	} else if(transcript_confidence < engine->trigger_min_transcript_confidence) {
+		return 0;
+	}
+	return abmod_gender_trigger_if_text(engine, room_id, user_id, text, engine->trigger_min_chars);
 }
 
 extern "C" void abmod_gender_clear_user(abmod_gender_engine *engine,

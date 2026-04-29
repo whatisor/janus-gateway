@@ -172,10 +172,28 @@ struct NativeStream {
 			on_err(cb_user, room_id, user_id, msg);
 	}
 
-	void emit_txt(const Aws::String &text, const Aws::String &result_id, bool is_final) {
+	void emit_txt(const Aws::String &text, float transcript_confidence, const Aws::String &result_id, bool is_final) {
 		if(!on_text || text.empty())
 			return;
-		on_text(cb_user, room_id, user_id, text.c_str(), result_id.c_str(), is_final ? 1 : 0);
+		on_text(cb_user, room_id, user_id, text.c_str(), transcript_confidence, result_id.c_str(), is_final ? 1 : 0);
+	}
+
+	float extract_alt_confidence(const MedicalAlternative &alt) {
+		const auto &items = alt.GetItems();
+		if(items.empty())
+			return -1.0f;
+		double sum = 0.0;
+		size_t n = 0;
+		for(const auto &it : items) {
+			const float v = (float)it.GetConfidence();
+			if(v < 0.0f || v > 1.0f)
+				continue;
+			sum += v;
+			n++;
+		}
+		if(n == 0)
+			return -1.0f;
+		return (float)(sum / (double)n);
 	}
 
 	void close_internal() {
@@ -346,7 +364,8 @@ struct NativeStream {
 				bool is_partial = r.GetIsPartial();
 				if(!cfg_fast_mode && is_partial)
 					continue;
-				emit_txt(txt, r.GetResultId(), !is_partial);
+				float transcript_confidence = extract_alt_confidence(alts[0]);
+				emit_txt(txt, transcript_confidence, r.GetResultId(), !is_partial);
 			}
 		});
 
