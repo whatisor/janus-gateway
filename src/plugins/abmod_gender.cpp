@@ -34,7 +34,7 @@ struct GenderState {
 
 struct abmod_gender_engine {
 	std::mutex mtx;
-	bool enabled = true;
+	bool enabled = false;
 	bool ready = false;
 	std::string model_path = ABMOD_GENDER_DEFAULT_MODEL;
 	int target_rate = 16000;
